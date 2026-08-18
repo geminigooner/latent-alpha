@@ -5,4 +5,4 @@ compatibility_date = "2025-06-01"
 [[d1_databases]]
 binding = "DB"
 database_name = "latent-alpha"
-database_id = "PASTE_YOUR_D1_DATABASE_ID_HERE"
+database_id = "a783778b-a1aa-431a-b87a-23005741e372"
