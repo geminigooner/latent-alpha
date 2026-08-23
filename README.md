@@ -41,3 +41,33 @@ market price series
 forward vs trailing realized volatility
     ↓
 Spearman correlation + permutation testing
+
+## Current result
+
+No significant relationship. Pooled across NVDA and GOOGL
+(n = 15 filings, 30-day windows):
+
+| metric | ρ | p |
+|---|---|---|
+| max shift | 0.029 | 0.93 |
+| p75 shift | −0.411 | 0.13 |
+| pooled | −0.275 | 0.32 |
+
+p-values are permutation tests (3,000 shuffles). All three metrics
+are computed and reported on every run so that none can be selected
+after the fact.
+
+At n = 15 this is closer to "not enough data" than "no effect."
+More companies is the next step, not a different metric.
+
+## Known limitations
+
+- **Section extraction is heuristic.** Filings are inconsistent HTML and
+  headers are indistinguishable from table-of-contents entries. An early
+  version silently included Legal Proceedings inside Risk Factors, which
+  made the metric fire on litigation updates rather than narrative.
+- **Small, correlated sample.** These companies move together, so the
+  effective sample is smaller than n suggests.
+- **Boilerplate.** A rewritten legal disclaimer moves the metric the same
+  way a strategy shift does. Every score can be traced back to the passage
+  that produced it for exactly this reason.
