@@ -1,0 +1,87 @@
+{
+  "paraphrase": [
+    {
+      "id": "para-1",
+      "before": "The Company's revenue growth was primarily driven by increased demand for its cloud computing services.",
+      "after": "Growth in revenue was mainly attributable to stronger demand for the Company's cloud computing offerings."
+    },
+    {
+      "id": "para-2",
+      "before": "We believe our competitive position benefits from significant economies of scale in data center operations.",
+      "after": "Our scale in data center operations gives us what we believe is a meaningful competitive advantage."
+    },
+    {
+      "id": "para-3",
+      "before": "Management expects operating margins to improve modestly over the next fiscal year.",
+      "after": "The Company anticipates a slight improvement in operating margins during the next fiscal year."
+    }
+  ],
+  "factual_change": [
+    {
+      "id": "fact-1",
+      "before": "Total revenue for the fiscal year increased 12% to $4.2 billion, compared to $3.75 billion in the prior year.",
+      "after": "Total revenue for the fiscal year increased 3% to $3.86 billion, compared to $3.75 billion in the prior year."
+    },
+    {
+      "id": "fact-2",
+      "before": "Research and development expenses were $820 million, representing 18% of total revenue.",
+      "after": "Research and development expenses were $410 million, representing 9% of total revenue."
+    },
+    {
+      "id": "fact-3",
+      "before": "The Company employed approximately 42,000 people as of the end of the fiscal year.",
+      "after": "The Company employed approximately 29,500 people as of the end of the fiscal year."
+    }
+  ],
+  "contradiction": [
+    {
+      "id": "contra-1",
+      "before": "We do not currently anticipate any material impact to our supply chain from the ongoing geopolitical tensions.",
+      "after": "We anticipate a material impact to our supply chain from the ongoing geopolitical tensions."
+    },
+    {
+      "id": "contra-2",
+      "before": "Management believes the Company's cash and cash equivalents are sufficient to meet operating needs for at least the next twelve months.",
+      "after": "Management does not believe the Company's cash and cash equivalents are sufficient to meet operating needs for the next twelve months."
+    },
+    {
+      "id": "contra-3",
+      "before": "The litigation described above is not expected to have a material adverse effect on our financial condition.",
+      "after": "The litigation described above is expected to have a material adverse effect on our financial condition."
+    }
+  ],
+  "risk_disclosure_added": [
+    {
+      "id": "risk-add-1",
+      "before": "Our business depends on our ability to attract and retain skilled engineering talent in a competitive labor market.",
+      "after": "Our business depends on our ability to attract and retain skilled engineering talent in a competitive labor market. Recent changes in immigration policy in jurisdictions where we operate could materially restrict our ability to hire and retain foreign national employees, which could adversely affect our product development timelines."
+    },
+    {
+      "id": "risk-add-2",
+      "before": "We rely on a limited number of third-party suppliers for critical components used in our products.",
+      "after": "We rely on a limited number of third-party suppliers for critical components used in our products. One of these suppliers has recently experienced financial distress, and its potential insolvency could disrupt our ability to manufacture products at anticipated volumes."
+    },
+    {
+      "id": "risk-remove-1",
+      "before": "Changes in international trade policy, including new tariffs on imported components, could increase our costs and adversely affect our margins.",
+      "after": "Changes in trade policy could affect our costs."
+    }
+  ],
+  "strategic_language_change": [
+    {
+      "id": "strat-1",
+      "before": "Our strategy is focused on organic growth through continued investment in our core product lines.",
+      "after": "Our strategy is focused on growth through disciplined acquisitions that complement our core product lines."
+    },
+    {
+      "id": "strat-2",
+      "before": "We intend to prioritize profitability and free cash flow generation over top-line revenue growth in the coming year.",
+      "after": "We intend to prioritize market share capture and top-line revenue growth over near-term profitability in the coming year."
+    },
+    {
+      "id": "strat-3",
+      "before": "The Company plans to expand its presence in international markets through direct investment in local operations.",
+      "after": "The Company plans to expand its presence in international markets primarily through partnerships and licensing arrangements rather than direct investment."
+    }
+  ]
+}
