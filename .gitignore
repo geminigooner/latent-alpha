@@ -1,41 +1,6 @@
-
-# Environment variables and API keys
-.env
-.env.*
-!.env.example
-
-# Dependencies
 node_modules/
-
-# Generated experiment results
+.env
+.env.local
 results_full.json
-results.json
-*.vectors.json
-
-# Local datasets and experimental inputs
-pairs.local.json
-data/local/
-datasets/local/
-
-# Logs
-logs/
 *.log
-npm-debug.log*
-
-# OS files
 .DS_Store
-Thumbs.db
-
-# Editor settings
-.vscode/
-.idea/
-
-# Temporary files
-*.tmp
-*.bak
-*.swp
-
-# Coverage and build output
-coverage/
-dist/
-build/
