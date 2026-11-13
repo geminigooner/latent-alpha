@@ -10,7 +10,7 @@
  *   POST /api/ingest          embed chunks for ONE section (Gemma 4 or Gemini), store in D1
  *   GET  /api/novelty?t=&m=   read D1, compute & cache novelty series for model m
  *   GET  /api/prices?t=       fetch daily closes (Yahoo -> Stooq) into D1
- *   GET  /api/test?m=         pooled + per-company Spearman permutation test for model m
+ *   GET  /api/test?t=&m=      per-company (or pooled) Spearman permutation test for model m
  *   POST /api/reset?t=&m=     wipe one ticker for model m
  */
 
@@ -134,7 +134,6 @@ async function listFilings(cik, limit) {
   return out.reverse();
 }
 
-/** Zero-CPU stream passthrough restricted strictly to SEC EDGAR archives. */
 async function proxySec(secUrl) {
   if (!secUrl || !secUrl.startsWith("https://www.sec.gov/Archives/edgar/data/")) {
     throw new Error("invalid SEC url");
@@ -148,10 +147,6 @@ async function proxySec(secUrl) {
 
 const BLOCK_OPEN_RE = /<(ix:header|ix:hidden|script|style)\b/i;
 
-/**
- * Chunked HTML -> visible text stripper with zero per-tag JS callbacks.
- * Jumps straight over multi-megabyte <ix:header> XBRL blocks in C++ indexOf.
- */
 async function filingText(url) {
   const res = await fetch(url, { headers: { "User-Agent": SEC_UA, "Accept-Encoding": "gzip" } });
   if (!res.ok) throw new Error(`filing fetch ${res.status}`);
@@ -282,7 +277,6 @@ function findAll(hay, needle) {
 
 const ITEM_HEADER_RE = /\bitem\s*\d{1,2}\s*[a-c]?\s*[.:)\-–—]/g;
 
-/** Pre-indexes markers & Item headers ONCE per filing so MD&A + Risk don't scan twice. */
 function prepareDocIndex(text, form = "10-K") {
   const formSpec = SECTIONS[form] || SECTIONS["10-K"];
   const low = text.toLowerCase().replace(/['\u2019`]/g, " ");
@@ -654,10 +648,13 @@ async function novelty(ticker, env, onlyKinds = ["mdna", "risk"], modelParam = "
   const b64PerChunk = (m.dim * 4 / 3) * 4;
   await ensureTables(env);
 
+  const kindPlaceholders = onlyKinds.map(() => "?").join(",");
   const { results: metaRows } = await env.DB.prepare(
     `SELECT key, form, filed, section, chars, vec, LENGTH(chunks) AS chunks_len
-     FROM sections WHERE ticker = ? AND key LIKE ? ORDER BY filed ASC`
-  ).bind(ticker, secPrefix(m.id, ticker)).all();
+     FROM sections
+     WHERE ticker = ? AND key LIKE ? AND section IN (${kindPlaceholders})
+     ORDER BY filed ASC`
+  ).bind(ticker, secPrefix(m.id, ticker), ...onlyKinds).all();
 
   const { results: cachedRows } = await env.DB.prepare(
     `SELECT key, max, p75 FROM shift_cache WHERE key LIKE ?`
@@ -880,19 +877,23 @@ function permTest(x, y, shuffles = 3000) {
 async function volTest(tickerParam, env, modelParam = "gemini") {
   const m = getModel(modelParam);
   await ensureTables(env);
-  const { results: priceRows } = await env.DB.prepare(`SELECT ticker, data FROM series`).all();
+
+  const priceQuery = tickerParam
+    ? env.DB.prepare(`SELECT ticker, data FROM series WHERE ticker = ?`).bind(tickerParam)
+    : env.DB.prepare(`SELECT ticker, data FROM series`);
+  const { results: priceRows } = await priceQuery.all();
   const priceMap = new Map();
   for (const r of priceRows) {
     try { priceMap.set(r.ticker, JSON.parse(r.data)); } catch {}
   }
 
-  const { results: secRows } = await env.DB.prepare(
-    `SELECT DISTINCT ticker FROM sections`
-  ).all();
-
-  const tickers = tickerParam
-    ? [tickerParam]
-    : [...new Set([...COMPANIES.map((c) => c.ticker), ...secRows.map((r) => r.ticker)])];
+  let tickers;
+  if (tickerParam) {
+    tickers = [tickerParam];
+  } else {
+    const { results: secRows } = await env.DB.prepare(`SELECT DISTINCT ticker FROM sections`).all();
+    tickers = [...new Set([...COMPANIES.map((c) => c.ticker), ...secRows.map((r) => r.ticker)])];
+  }
 
   const observations = [];
 
@@ -921,17 +922,19 @@ async function volTest(tickerParam, env, modelParam = "gemini") {
     }
   }
 
-  const ys = observations.map((o) => o.volRatio);
-  const pooledTests = {};
-  for (const metric of ["max", "p75", "pooled"]) {
-    const xs = observations.map((o) => o[metric]);
-    pooledTests[metric] = permTest(xs, ys, 3000);
-  }
-
   const perCompany = {};
   for (const t of tickers) {
     const sub = observations.filter((o) => o.ticker === t);
     perCompany[t] = permTest(sub.map((o) => o.max), sub.map((o) => o.volRatio), 1000);
+  }
+
+  const pooledTests = {};
+  if (!tickerParam) {
+    const ys = observations.map((o) => o.volRatio);
+    for (const metric of ["max", "p75", "pooled"]) {
+      const xs = observations.map((o) => o[metric]);
+      pooledTests[metric] = permTest(xs, ys, 3000);
+    }
   }
 
   return { model: m.id, modelLabel: m.short, n: observations.length, pooled: pooledTests, perCompany, observations };
@@ -1018,15 +1021,10 @@ async function topChunk(params, env) {
 
 async function exportText(env, modelParam) {
   const st = await status(env);
-  const targetModels = modelParam ? [getModel(modelParam).id] : ["gemma2", "gemini"];
-  const modelsOut = {};
-  for (const mId of targetModels) {
-    const vt = await volTest(null, env, mId);
-    const nov = {};
-    for (const c of COMPANIES) nov[c.ticker] = await novelty(c.ticker, env, ["mdna", "risk"], mId);
-    modelsOut[mId] = { volTest: vt, novelty: nov };
-  }
-  return JSON.stringify({ exported: new Date().toISOString(), status: st, models: modelsOut }, null, 2);
+  const mId = getModel(modelParam || "gemini").id;
+  const nov = {};
+  for (const c of COMPANIES) nov[c.ticker] = await novelty(c.ticker, env, ["mdna", "risk"], mId);
+  return JSON.stringify({ exported: new Date().toISOString(), model: mId, status: st, novelty: nov }, null, 2);
 }
 
 /* ─────────────────────────────────────────────── page */
@@ -1165,7 +1163,64 @@ async function api(url, opts) {
   return data;
 }
 
-/** Browser-side HTML stripper fallback if a 50MB+ filing ever hits Worker 10ms CPU cap. */
+function rankArray(arr) {
+  const indexed = arr.map((v, i) => ({ v, i })).sort((a, b) => a.v - b.v);
+  const ranks = new Array(arr.length);
+  let i = 0;
+  while (i < indexed.length) {
+    let j = i;
+    while (j + 1 < indexed.length && indexed[j + 1].v === indexed[i].v) j++;
+    const avgRank = (i + j) / 2 + 1;
+    for (let k = i; k <= j; k++) ranks[indexed[k].i] = avgRank;
+    i = j + 1;
+  }
+  return ranks;
+}
+
+function spearman(x, y) {
+  const n = x.length;
+  if (n < 3) return null;
+  const rx = rankArray(x), ry = rankArray(y);
+  const mx = rx.reduce((a, b) => a + b, 0) / n;
+  const my = ry.reduce((a, b) => a + b, 0) / n;
+  let num = 0, dx = 0, dy = 0;
+  for (let i = 0; i < n; i++) {
+    const a = rx[i] - mx, b = ry[i] - my;
+    num += a * b; dx += a * a; dy += b * b;
+  }
+  const den = Math.sqrt(dx * dy);
+  return den === 0 ? 0 : num / den;
+}
+
+function permTest(x, y, shuffles) {
+  const n = x.length;
+  if (n < 4) return { n, rho: null, p: null };
+  const obs = spearman(x, y);
+  if (obs == null || !isFinite(obs)) return { n, rho: null, p: null };
+  const rx = rankArray(x), ry = rankArray(y);
+  const mx = rx.reduce((a, b) => a + b, 0) / n;
+  const my = ry.reduce((a, b) => a + b, 0) / n;
+  const ax = new Float64Array(n), ay = new Float64Array(n);
+  let dx = 0, dy = 0;
+  for (let i = 0; i < n; i++) {
+    ax[i] = rx[i] - mx; ay[i] = ry[i] - my;
+    dx += ax[i] * ax[i]; dy += ay[i] * ay[i];
+  }
+  const den = Math.sqrt(dx * dy);
+  if (den === 0) return { n, rho: 0, p: 1 };
+  let extreme = 0;
+  for (let s = 0; s < shuffles; s++) {
+    for (let i = n - 1; i > 0; i--) {
+      const j = (Math.random() * (i + 1)) | 0;
+      const tmp = ay[i]; ay[i] = ay[j]; ay[j] = tmp;
+    }
+    let num = 0;
+    for (let i = 0; i < n; i++) num += ax[i] * ay[i];
+    if (Math.abs(num / den) >= Math.abs(obs) - 1e-12) extreme++;
+  }
+  return { n, rho: obs, p: (extreme + 1) / (shuffles + 1) };
+}
+
 async function browserStripSec(secUrl) {
   const r = await fetch("/api/raw?url=" + encodeURIComponent(secUrl));
   if (!r.ok) throw new Error("raw fetch HTTP " + r.status);
@@ -1344,29 +1399,45 @@ $("testBtn").onclick = async () => {
   $("testBtn").disabled = true;
   const mId = curModel();
   const out = $("testOut");
-  out.innerHTML = '<div class="note">running 3,000-shuffle permutation test (' + mId + ")…</div>";
   try {
-    const d = await api("/api/test?m=" + mId);
+    const observations = [];
+    const perCompany = {};
+    let modelLabel = mId;
+
+    for (const t of ALL_TICKERS) {
+      out.innerHTML = '<div class="note">scoring ' + t + " (" + mId + ")…</div>";
+      const part = await api("/api/test?t=" + t + "&m=" + mId);
+      if (part.modelLabel) modelLabel = part.modelLabel;
+      if (part.perCompany && part.perCompany[t]) perCompany[t] = part.perCompany[t];
+      for (const o of (part.observations || [])) observations.push(o);
+    }
+
+    out.innerHTML = '<div class="note">running 3,000-shuffle permutation test (n = ' + observations.length + ")…</div>";
+    const ys = observations.map((o) => o.volRatio);
+    const pooled = {};
+    for (const metric of ["max", "p75", "pooled"]) {
+      pooled[metric] = permTest(observations.map((o) => o[metric]), ys, 3000);
+    }
+
     const fmt = (x) => (x == null ? "—" : x.toFixed(3));
-    let h = "<h2>Pooled across companies · " + d.modelLabel + " · n = " + d.n + " filings · target = log(vol₊₃₀ / vol₋₃₀)</h2>";
+    let h = "<h2>Pooled across companies · " + modelLabel + " · n = " + observations.length + " filings · target = log(vol₊₃₀ / vol₋₃₀)</h2>";
     h += "<table><tr><th>MD&amp;A novelty metric</th><th class=num>Spearman ρ</th><th class=num>two-sided p (perm)</th></tr>";
-    for (const [k, v] of Object.entries(d.pooled)) {
+    for (const [k, v] of Object.entries(pooled)) {
       const sig = v.p != null && v.p < 0.05;
       h += "<tr><td>" + k + '</td><td class="num">' + fmt(v.rho) + '</td><td class="num" style="color:' + (sig ? "var(--hot)" : "var(--dim)") + '">' + fmt(v.p) + "</td></tr>";
     }
     h += "</table>";
 
     h += "<h2>Within each company (max shift vs vol ratio)</h2><table><tr><th>ticker</th><th class=num>n</th><th class=num>Spearman ρ</th><th class=num>p</th></tr>";
-    for (const [t, info] of Object.entries(d.perCompany || {})) {
-      if (!info.n && !ALL_TICKERS.includes(t)) continue;
+    for (const [t, info] of Object.entries(perCompany)) {
       const tooFew = (info.n || 0) < 4;
       h += "<tr><td><b>" + t + '</b></td><td class="num">' + (info.n || 0) + '</td><td class="num">' + (tooFew ? "—" : fmt(info.rho)) + '</td><td class="num" style="color:var(--dim)">' + (tooFew ? "too few" : fmt(info.p)) + "</td></tr>";
     }
     h += "</table>";
 
-    if (d.observations.length) {
+    if (observations.length) {
       h += "<h2>Every observation</h2><table><tr><th>filing</th><th class=num>max shift</th><th class=num>pre vol</th><th class=num>post vol</th><th class=num>log ratio</th></tr>";
-      for (const o of d.observations.slice().sort((a, b) => b.max - a.max)) {
+      for (const o of observations.slice().sort((a, b) => b.max - a.max)) {
         const up = o.volRatio > 0;
         h += "<tr><td>" + o.ticker + " " + o.form + " " + o.filed + "</td>"
           + '<td class="num">' + o.max.toFixed(4) + "</td>"
