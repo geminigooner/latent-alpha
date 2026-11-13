@@ -121,21 +121,38 @@ function decodeEntities(s) {
 /* ─────────────────────────────────────────────── section extraction */
 
 /**
- * Anchor on section TITLES, not item numbers — MD&A is Item 7 in a 10-K
- * and Item 2 in a 10-Q. Apostrophes are normalised to spaces (length
- * preserved, so indices stay valid), which makes "management's discussion"
- * and "managements discussion" both match on "s discussion and analysis".
+ * Form-aware section extraction.
+ * 10-K: MD&A is Item 7, Risk Factors is Item 1A
+ * 10-Q: MD&A is Part I Item 2, Risk Factors is Part II Item 1A
  */
 const SECTIONS = {
-  mdna: {
-    label: "MD&A",
-    start: ["s discussion and analysis"],
-    end: ["quantitative and qualitative disclosures", "controls and procedures", "financial statements and supplementary"],
+  "10-K": {
+    mdna: {
+      label: "MD&A",
+      start: ["item 7.", "item 7 .", "item7."],
+      end: ["item 7a.", "item 7a .", "item 8.", "item 8 ."],
+      fallbackStart: ["s discussion and analysis"],
+    },
+    risk: {
+      label: "Risk Factors",
+      start: ["item 1a.", "item 1a .", "item1a."],
+      end: ["item 1b.", "item 1b .", "item 2.", "item 2 ."],
+      fallbackStart: ["risk factors"],
+    },
   },
-  risk: {
-    label: "Risk Factors",
-    start: ["risk factors"],
-    end: ["unresolved staff comments", "legal proceedings", "unregistered sales of equity", "properties"],
+  "10-Q": {
+    mdna: {
+      label: "MD&A",
+      start: ["item 2.", "item 2 .", "item2."],
+      end: ["item 3.", "item 3 .", "item 4.", "item 4 .", "part ii"],
+      fallbackStart: ["s discussion and analysis"],
+    },
+    risk: {
+      label: "Risk Factors",
+      start: ["item 1a.", "item 1a .", "item1a."],
+      end: ["item 2.", "item 2 .", "item 3.", "item 3 .", "item 6.", "item 6 .", "signatures"],
+      fallbackStart: ["risk factors"],
+    },
   },
 };
 
@@ -146,52 +163,50 @@ function findAll(hay, needle) {
   return out;
 }
 
-const ALL_MARKERS = [...new Set(
-  Object.values(SECTIONS).flatMap((s) => [...s.start, ...s.end])
-)];
-
-// "Item 1A. Risk Factors" is a header. "see the risk factors described
-// elsewhere" is a cross-reference and must not be treated as a boundary.
 const HEADER_PREFIX = /item\s*\d{1,2}\s*[a-c]?\s*[.:)\-–—]?\s*$/;
 
-/**
- * Pull one section out of flat filing text.
- *
- * The first version took the LONGEST (start, end) span, which is backwards:
- * the span from a table-of-contents entry to the real end marker is always
- * longer than the real section, so it swallowed whatever sat in between. That
- * is how Legal Proceedings ended up inside Risk Factors, which made the max
- * metric fire on litigation updates instead of narrative.
- *
- * A TOC entry and a real header are textually identical, so the thing that
- * separates them is density: in a table of contents six markers sit within a
- * few hundred characters, while a real header stands alone in body text.
- * Candidates in a dense cluster are dropped, and any span that swallows
- * another real header is rejected.
- */
-function extractSection(text, kind) {
-  const spec = SECTIONS[kind];
+function extractSection(text, kind, form) {
+  const spec = SECTIONS[form]?.[kind];
+  if (!spec) return null;
+  
   const low = text.toLowerCase().replace(/['\u2019`]/g, " ");
 
-  const all = ALL_MARKERS.flatMap((m) => findAll(low, m)).sort((a, b) => a - b);
+  // Collect all possible markers for this form type to check for TOC density
+  const allMarkers = [...spec.start, ...spec.end, ...spec.fallbackStart];
+  const all = allMarkers.flatMap((m) => findAll(low, m)).sort((a, b) => a - b);
+  
+  // If 4+ markers appear within 1500 chars, it's a Table of Contents, ignore them.
   const inTOC = (p) => all.filter((q) => Math.abs(q - p) < 1500).length >= 4;
-  const headers = all.filter((p) => HEADER_PREFIX.test(low.slice(Math.max(0, p - 40), p)));
-
-  const starts = spec.start.flatMap((m) => findAll(low, m)).sort((a, b) => a - b).filter((p) => !inTOC(p));
+  
+  // Find real section starts
+  let starts = spec.start.flatMap((m) => findAll(low, m)).sort((a, b) => a - b).filter((p) => !inTOC(p));
+  if (!starts.length) {
+    starts = spec.fallbackStart.flatMap((m) => findAll(low, m)).sort((a, b) => a - b).filter((p) => !inTOC(p));
+  }
   if (!starts.length) return null;
+  
   const ends = spec.end.flatMap((m) => findAll(low, m)).sort((a, b) => a - b).filter((p) => !inTOC(p));
 
+  // Find the longest valid span that doesn't swallow another Item header
+  const headers = all.filter((p) => HEADER_PREFIX.test(low.slice(Math.max(0, p - 40), p)));
+  
   let best = null;
   for (const s of starts) {
     const e = ends.find((x) => x > s + 200);
     const stop = e ?? Math.min(s + 120_000, text.length);
-    if (headers.some((o) => o > s + 200 && o < stop - 50)) continue;   // swallowed a section
+    if (headers.some((o) => o > s + 200 && o < stop - 50)) continue; // Swallowed a different section
     if (!best || stop - s > best[1] - best[0]) best = [s, stop];
   }
+  
   if (!best) return null;
 
   const body = text.slice(best[0], best[1]);
-  return body.length > 1500 ? body : null;
+  
+  // 10-Q Risk Factors are sometimes just "There have been no material changes..."
+  // If it's a 10-Q and it's short, allow it through (min 100 chars instead of 1500)
+  const minLength = form === "10-Q" && kind === "risk" ? 100 : 1500;
+  
+  return body.length > minLength ? body : null;
 }
 
 /** Safe-harbour language is near-identical every quarter; it would flatten novelty. */
@@ -305,11 +320,10 @@ async function ingest(body, env) {
   const { ticker, form, filed, url, section } = body;
   if (!env.GEMINI_API_KEY) throw new Error("GEMINI_API_KEY secret not set");
 
-  // One section per request. Both sections in a single invocation was enough
-  // work — fetch a 3MB filing, embed 60 chunks, base64 and write 370KB to D1,
-  // twice — to trip the Worker resource limit on the larger filings and return
-  // a 503 HTML error page instead of JSON.
-  const kinds = section && SECTIONS[section] ? [section] : Object.keys(SECTIONS);
+  // Only try to ingest if we actually have specs for this form type
+  if (!SECTIONS[form]) throw new Error(`Unsupported form type: ${form}`);
+
+  const kinds = section && SECTIONS[form][section] ? [section] : Object.keys(SECTIONS[form]);
 
   const keys = kinds.map((k) => `${ticker}:${filed}:${form}:${k}`);
   const have = await env.DB.prepare(
@@ -323,7 +337,7 @@ async function ingest(body, env) {
 
   for (const kind of kinds) {
     if (stored.has(`${ticker}:${filed}:${form}:${kind}`)) { done.push({ kind, status: "cached" }); continue; }
-    const raw = extractSection(text, kind);
+    const raw = extractSection(text, kind, form);
     if (!raw) { done.push({ kind, status: "not found" }); continue; }
 
     const clean = stripBoilerplate(raw);
@@ -386,7 +400,14 @@ async function novelty(ticker, env) {
   ).bind(ticker).all();
 
   const out = {};
-  for (const kind of Object.keys(SECTIONS)) {
+  
+  // We extract keys from both 10-K and 10-Q since they share the 'mdna' and 'risk' namespaces
+  const allKinds = [...new Set([
+    ...Object.keys(SECTIONS["10-K"]), 
+    ...Object.keys(SECTIONS["10-Q"])
+  ])];
+
+  for (const kind of allKinds) {
     const rows = results.filter((r) => r.section === kind).map((r) => ({
       ...r,
       v: JSON.parse(r.vec),
@@ -501,511 +522,4 @@ function realisedVol(closes) {
   return Math.sqrt(varc * 252);
 }
 
-/* ─────────────────────────────────────────────── statistics */
-
-function ranks(xs) {
-  const idx = xs.map((v, i) => [v, i]).sort((a, b) => a[0] - b[0]);
-  const r = new Array(xs.length);
-  for (let i = 0; i < idx.length;) {           // average ranks within ties
-    let j = i;
-    while (j + 1 < idx.length && idx[j + 1][0] === idx[i][0]) j++;
-    const avg = (i + j) / 2 + 1;
-    for (let k = i; k <= j; k++) r[idx[k][1]] = avg;
-    i = j + 1;
-  }
-  return r;
-}
-
-function pearson(a, b) {
-  const n = a.length;
-  const ma = a.reduce((x, y) => x + y, 0) / n;
-  const mb = b.reduce((x, y) => x + y, 0) / n;
-  let num = 0, da = 0, db = 0;
-  for (let i = 0; i < n; i++) {
-    const x = a[i] - ma, y = b[i] - mb;
-    num += x * y; da += x * x; db += y * y;
-  }
-  return da && db ? num / Math.sqrt(da * db) : 0;
-}
-
-const spearman = (a, b) => pearson(ranks(a), ranks(b));
-
-/**
- * Permutation test. With ~15 filings per company a correlation coefficient on
- * its own is close to meaningless — shuffling the labels a few thousand times
- * and asking how often chance beats the observed value is the honest version.
- */
-function permutationP(a, b, iters = 3000) {
-  const observed = Math.abs(spearman(a, b));
-  const shuffled = b.slice();
-  let hits = 0;
-  for (let it = 0; it < iters; it++) {
-    for (let i = shuffled.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-    }
-    if (Math.abs(spearman(a, shuffled)) >= observed) hits++;
-  }
-  return { rho: spearman(a, b), p: (hits + 1) / (iters + 1), n: a.length };
-}
-
-const zscore = (xs) => {
-  const m = xs.reduce((a, b) => a + b, 0) / xs.length;
-  const sd = Math.sqrt(xs.reduce((a, b) => a + (b - m) ** 2, 0) / Math.max(1, xs.length - 1)) || 1;
-  return xs.map((x) => (x - m) / sd);
-};
-
-/* ─────────────────────────────────────────────── the test
-
-   Hypothesis, fixed before looking: filings whose language moved unusually far
-   from the same company's previous same-form filing are followed by higher
-   realised volatility than that company's own recent baseline.
-
-   Only same-form novelty is used (10-Q vs previous 10-Q) — the consecutive
-   series spikes every year for structural reasons. Forward vol starts the
-   trading day AFTER the filing date, so nothing from the future leaks in. */
-
-const WINDOW = 30;
-const METRICS = ["max", "p75", "pooled"];
-
-/**
- * Runs every metric, every time. Selecting one after seeing the results is how
- * you manufacture a finding; the defence is that all three are always on the
- * record, so the comparison can be audited later.
- */
-async function volTest(which, env) {
-  const all = (await env.DB.prepare(`SELECT DISTINCT ticker FROM sections`).all())
-    .results.map((r) => r.ticker);
-  const tickers = which && which !== "ALL" ? [which] : all;
-
-  const cache = {}, missing = [];
-  for (const ticker of tickers) {
-    const row = await env.DB.prepare(`SELECT data FROM series WHERE ticker = ?`).bind(ticker).first();
-    if (!row) { missing.push(ticker); continue; }
-    const series = JSON.parse(row.data);
-    cache[ticker] = {
-      dates: series.map((r) => r[0]),
-      closes: series.map((r) => r[1]),
-      nov: (await novelty(ticker, env)).mdna,
-    };
-  }
-
-  const out = {};
-  for (const m of METRICS) {
-    const perTicker = [], pooledNov = [], pooledVol = [];
-
-    for (const ticker of Object.keys(cache)) {
-      const { dates, closes, nov } = cache[ticker];
-      const rows = [];
-
-      for (const f of nov) {
-        if (f[m] == null) continue;
-        const i = dates.findIndex((d) => d > f.filed);   // first close strictly after filing
-        if (i < WINDOW || i + WINDOW >= closes.length) continue;
-
-        const fwd = realisedVol(closes.slice(i, i + WINDOW));
-        const trail = realisedVol(closes.slice(i - WINDOW, i));
-        if (!fwd || !trail) continue;
-        rows.push({ filed: f.filed, novelty: f[m], ratio: fwd / trail });
-      }
-
-      if (rows.length >= 4) {
-        const n = rows.map((r) => r.novelty);
-        const v = rows.map((r) => Math.log(r.ratio));
-        perTicker.push({ ticker, ...permutationP(n, v) });
-        pooledNov.push(...zscore(n));                    // z-score within ticker
-        pooledVol.push(...zscore(v));                    // before pooling
-      } else {
-        perTicker.push({ ticker, rho: null, p: null, n: rows.length });
-      }
-    }
-    out[m] = { perTicker, pooled: pooledNov.length >= 8 ? permutationP(pooledNov, pooledVol) : null };
-  }
-
-  return { window: WINDOW, metrics: out, missingPrices: missing };
-}
-
-
-/* ─────────────────────────────────────────────── what actually moved
-
-   A number can't tell you whether max fired on a strategy shift or on a new
-   legal disclaimer, and those demand opposite conclusions. This returns the
-   passage that won, and the passage it was compared against.
-
-   Chunk text isn't stored — only vectors. Rather than re-embed everything to
-   add a text column, this re-fetches the filing and re-runs the identical
-   extract → strip → chunk path. Chunking is deterministic on the same input,
-   so index n here is the same passage as index n at ingest time. */
-
-async function sectionParts(url, kind) {
-  const raw = extractSection(await filingText(url), kind);
-  if (!raw) return null;
-  return chunk(stripBoilerplate(raw)).slice(0, 40);   // must match ingest
-}
-
-async function topChunk(params, env) {
-  const ticker = params.get("t");
-  const filed = params.get("filed");
-  const kind = params.get("section") || "mdna";
-  const cik = params.get("cik");
-  if (!ticker || !filed || !cik) throw new Error("need t, filed, cik");
-
-  const { results } = await env.DB.prepare(
-    `SELECT form, filed, chunks FROM sections
-     WHERE ticker = ? AND section = ? AND chunks IS NOT NULL ORDER BY filed ASC`
-  ).bind(ticker, kind).all();
-
-  const i = results.findIndex((r) => r.filed === filed);
-  if (i < 0) throw new Error(`no stored ${kind} for ${ticker} ${filed}`);
-
-  let prev = null;
-  for (let j = i - 1; j >= 0; j--) if (results[j].form === results[i].form) { prev = results[j]; break; }
-  if (!prev) throw new Error("no previous same-form filing to compare against");
-
-  const cur = unpackVecs(results[i].chunks, EMBED_DIM);
-  const old = unpackVecs(prev.chunks, EMBED_DIM);
-
-  // the chunk whose nearest neighbour last quarter is furthest away
-  let bestI = 0, bestD = -1, bestJ = 0;
-  cur.forEach((a, ci) => {
-    let near = 2, nearJ = 0;
-    old.forEach((b, pj) => {
-      let dot = 0;
-      for (let k = 0; k < a.length; k++) dot += a[k] * b[k];
-      const d = 1 - dot;
-      if (d < near) { near = d; nearJ = pj; }
-    });
-    if (near > bestD) { bestD = near; bestI = ci; bestJ = nearJ; }
-  });
-
-  // recover the text by walking the same path the ingest took
-  const filings = await listFilings(cik, 40);
-  const findUrl = (d) => filings.find((f) => f.filed === d)?.url;
-  const curUrl = findUrl(filed), prevUrl = findUrl(prev.filed);
-  if (!curUrl || !prevUrl) throw new Error("filing no longer in the EDGAR index window");
-
-  const curParts = await sectionParts(curUrl, kind);
-  const prevParts = await sectionParts(prevUrl, kind);
-
-  return {
-    ticker, section: kind, filed, form: results[i].form,
-    comparedTo: prev.filed,
-    distance: bestD,
-    chunkIndex: bestI, of: cur.length,
-    text: curParts?.[bestI] ?? "(could not recover text)",
-    nearestPrevText: prevParts?.[bestJ] ?? "(could not recover text)",
-  };
-}
-
-
-/* Everything in one plain-text page. Readable and copyable on a phone without
-   downloading a file or opening JSON, which iOS makes unreasonably hard. */
-async function exportText(env) {
-  const pad = (s, n) => String(s).padEnd(n);
-  const num = (v, n = 4) => (v == null ? "—" : v.toFixed(n));
-  const L = [];
-
-  L.push("LATENT ALPHA — results export");
-  L.push(new Date().toISOString().slice(0, 16).replace("T", " ") + " UTC");
-  L.push("");
-
-  const tickers = (await env.DB.prepare(`SELECT DISTINCT ticker FROM sections ORDER BY ticker`).all())
-    .results.map((r) => r.ticker);
-
-  for (const t of tickers) {
-    const nov = await novelty(t, env);
-    for (const kind of Object.keys(nov)) {
-      const rows = nov[kind];
-      if (!rows.length) continue;
-      L.push(`${t} · ${kind}`);
-      L.push(`${pad("filed", 12)}${pad("form", 6)}${pad("pooled", 10)}${pad("max", 10)}${pad("p75", 10)}chunks`);
-      for (const r of rows) {
-        L.push(pad(r.filed, 12) + pad(r.form, 6) + pad(num(r.pooled), 10) +
-               pad(num(r.max), 10) + pad(num(r.p75), 10) + r.chunks);
-      }
-      L.push("");
-    }
-  }
-
-  const test = await volTest("ALL", env);
-  L.push(`FORWARD VOLATILITY TEST · ${test.window}-day window`);
-  L.push("realised vol after filing / realised vol before, vs novelty");
-  L.push("");
-  L.push(`${pad("metric", 10)}${pad("n", 5)}${pad("rho", 9)}p`);
-  for (const m of ["max", "p75", "pooled"]) {
-    const p = test.metrics[m].pooled;
-    L.push(pad(m, 10) + pad(p ? p.n : "—", 5) + pad(p ? p.rho.toFixed(3) : "—", 9) +
-           (p ? p.p.toFixed(4) : "—"));
-  }
-  L.push("");
-  L.push("per company (max):");
-  for (const r of test.metrics.max.perTicker) {
-    L.push(`  ${pad(r.ticker, 8)}n=${pad(r.n, 5)}rho=${pad(r.rho != null ? r.rho.toFixed(3) : "—", 9)}` +
-           `p=${r.p != null ? r.p.toFixed(3) : "—"}`);
-  }
-  if (test.missingPrices.length) L.push("\nno prices: " + test.missingPrices.join(" "));
-
-  L.push("");
-  L.push("All three metrics computed every run; none selected after the fact.");
-  L.push("p-values are permutation tests, 3000 shuffles.");
-  return L.join("\n");
-}
-
-async function status(env) {
-  const { results } = await env.DB.prepare(
-    `SELECT ticker, section,
-            COUNT(*) AS rows,
-            SUM(CASE WHEN chunks IS NULL THEN 1 ELSE 0 END) AS missing_chunks,
-            MIN(filed) AS first, MAX(filed) AS last
-     FROM sections GROUP BY ticker, section ORDER BY ticker, section`
-  ).all();
-  const prices = (await env.DB.prepare(`SELECT ticker FROM series`).all())
-    .results.map((r) => r.ticker);
-  return { sections: results, prices };
-}
-
-async function reset(ticker, env) {
-  await env.DB.prepare(`DELETE FROM sections WHERE ticker = ?`).bind(ticker).run();
-  return { cleared: ticker };
-}
-
-/* ─────────────────────────────────────────────── page */
-
-const PAGE = `<!doctype html>
-<html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Latent Alpha — Phase 0</title>
-<style>
-:root{
-  --ink:#0d0b0b; --panel:#151112; --line:#2a2323;
-  --text:#e6e0dd; --mute:#7d7370; --rose:#d6a2a8;
-  --mono:ui-monospace,"SF Mono",Menlo,monospace;
-}
-*{box-sizing:border-box}
-body{margin:0;background:var(--ink);color:var(--text);font-family:var(--mono);
-  font-size:13px;line-height:1.55;padding:20px 16px 80px;-webkit-text-size-adjust:100%}
-h1{font-size:13px;font-weight:500;letter-spacing:.18em;text-transform:uppercase;margin:0}
-.sub{color:var(--mute);font-size:11px;letter-spacing:.06em;margin:4px 0 24px}
-label{display:block;color:var(--mute);font-size:10px;letter-spacing:.14em;
-  text-transform:uppercase;margin:14px 0 5px}
-select,button{width:100%;font-family:var(--mono);font-size:13px;padding:11px 12px;
-  background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:2px}
-button{margin-top:16px;color:var(--rose);letter-spacing:.14em;text-transform:uppercase;
-  font-size:11px;cursor:pointer}
-button:disabled{color:var(--mute);cursor:default}
-#log{margin-top:18px;color:var(--mute);font-size:11px;white-space:pre-wrap;
-  max-height:180px;overflow:auto}
-.sec{margin-top:34px;border-top:1px solid var(--line);padding-top:14px}
-.sec h2{font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--rose);
-  font-weight:500;margin:0 0 12px}
-table{width:100%;border-collapse:collapse;font-size:12px}
-th{text-align:right;color:var(--mute);font-size:9px;letter-spacing:.1em;
-  text-transform:uppercase;font-weight:400;padding-bottom:7px;border-bottom:1px solid var(--line)}
-th:first-child,td:first-child{text-align:left}
-td{padding:7px 0;border-bottom:1px solid #1c1717}
-.bar{display:block;height:3px;background:var(--rose);border-radius:2px;min-width:1px;
-  transform:scaleX(0);transform-origin:left;transition:transform .85s cubic-bezier(.22,.9,.24,1)}
-.bar.in{transform:scaleX(1)}
-tr.insp{cursor:pointer}
-tr.insp:active td{color:var(--rose)}
-.quote{margin-top:10px;padding:14px 15px;background:#131011;border-left:2px solid var(--rose);
-  border-radius:2px;font-size:12px;line-height:1.65;max-height:280px;overflow:auto}
-.quote.dim{border-left-color:var(--line);color:var(--mute)}
-@media (prefers-reduced-motion:reduce){.bar{transition:none;transform:scaleX(1)}}
-.note{color:var(--mute);font-size:11px;margin-top:10px;line-height:1.6}
-.dim{color:var(--mute)}
-</style></head><body>
-
-<h1>Latent Alpha</h1>
-<div class="sub">narrative novelty · sec edgar · gemini embeddings</div>
-
-<label>Company</label>
-<select id="co">
-  <option value="1045810">NVDA — Nvidia</option>
-  <option value="789019">MSFT — Microsoft</option>
-  <option value="1652044">GOOGL — Alphabet</option>
-  <option value="1326801">META — Meta</option>
-  <option value="1018724">AMZN — Amazon</option>
-  <option value="2488">AMD</option>
-  <option value="1046179">TSM — Taiwan Semi</option>
-</select>
-
-<label>Filings</label>
-<select id="n"><option>6</option><option selected>10</option><option>14</option></select>
-
-<button id="go">Ingest &amp; measure</button>
-<div id="log"></div>
-<div id="out"></div>
-
-<div class="sec">
-  <h2>Does it predict anything?</h2>
-  <div class="note" style="margin:0 0 14px">
-    Hypothesis, fixed before looking: filings whose language moved unusually far
-    from the same company's previous same-form filing are followed by higher
-    realised volatility than that company's own recent baseline.
-    Forward window starts the trading day <i>after</i> the filing.
-  </div>
-  <button id="px">Load prices</button>
-  <button id="run">Run test</button>
-  <div id="tlog"></div>
-  <div id="tout"></div>
-</div>
-
-<script>
-const $=s=>document.querySelector(s);
-const log=m=>{$('#log').textContent+=m+"\\n";$('#log').scrollTop=1e6};
-
-// Every fetch goes through this. A Worker that trips a resource limit returns
-// an HTML error page, and .json() on that throws "the string did not match the
-// expected pattern" — which tells you nothing and killed whole runs.
-async function api(url,opts){
-  const res=await fetch(url,opts);
-  const raw=await res.text();
-  try{ return JSON.parse(raw); }
-  catch{ return {error:'HTTP '+res.status+' — '+raw.slice(0,90).replace(/\\s+/g,' ')}; }
-}
-
-$('#go').onclick=async()=>{
-  const btn=$('#go'); btn.disabled=true;
-  $('#log').textContent=''; $('#out').innerHTML='';
-  const cik=$('#co').value, ticker=$('#co').selectedOptions[0].text.split(' ')[0], n=$('#n').value;
-
-  try{
-    log('fetching filing index…');
-    const filings=await api('/api/filings?cik='+cik+'&n='+n);
-    if(filings.error) throw new Error(filings.error);
-    log(filings.length+' filings · '+filings[0].filed+' → '+filings[filings.length-1].filed+'\\n');
-
-    let quota=false;
-    outer:
-    for(const f of filings){
-      log(f.filed+'  '+f.form);
-      // one section per request — two at once was enough work to trip the
-      // Worker resource limit on the bigger filings
-      for(const section of ['mdna','risk']){
-        const r=await api('/api/ingest',{method:'POST',
-          headers:{'content-type':'application/json'},
-          body:JSON.stringify({ticker,section,...f})});
-
-        if(r.error){
-          if(r.error==='QUOTA'){ quota=true; log('   ! Gemini quota reached — stopping'); break outer; }
-          log('   '+section+' ! '+r.error); continue;
-        }
-        if(r.skipped){ log('   '+section+' cached'); continue; }
-        const s=r.sections[0];
-        log('   '+section+' '+(s&&s.chars ? s.chars.toLocaleString()+'c · '+s.chunks+' chunks' : (s?s.status:'—')));
-      }
-    }
-    if(quota) log('\\nQuota resets daily. Press again later — stored filings are skipped.');
-
-    log('\\ncomputing novelty…');
-    const nov=await api('/api/novelty?t='+ticker);
-    if(nov.error) throw new Error(nov.error);
-    render(nov, ticker);
-  }catch(e){ log('ERROR: '+e.message); }
-  btn.disabled=false;
-};
-
-$('#px').onclick=async()=>{
-  const b=$('#px'); b.disabled=true; $('#tlog').textContent='';
-  const tlog=m=>{$('#tlog').textContent+=m+"\\n"};
-  const tickers=[...$('#co').options].map(o=>o.text.split(' ')[0]);
-  for(const t of tickers){
-    const r=await api('/api/prices?t='+t,{method:'POST'});
-    tlog(r.error ? t+'  ! '+r.error : t+'  '+r.days+' days  '+r.from+' → '+r.to+'  ·  '+r.source);
-  }
-  b.disabled=false;
-};
-
-$('#run').onclick=async()=>{
-  const b=$('#run'); b.disabled=true; $('#tout').innerHTML='';
-  $('#tlog').textContent='running permutation test…';
-  const d=await api('/api/test?t=ALL');
-  if(d.error){ $('#tlog').textContent='ERROR: '+d.error; b.disabled=false; return; }
-  $('#tlog').textContent = d.missingPrices.length ? 'no prices for: '+d.missingPrices.join(' ') : '';
-  renderTest(d);
-  b.disabled=false;
-};
-
-function renderTest(d){
-  const names={max:'max shift',p75:'p75 shift',pooled:'pooled'};
-  let h='<table><tr><th>Metric</th><th>n</th><th>ρ</th><th>p</th></tr>';
-  for(const m of ['max','p75','pooled']){
-    const p=d.metrics[m].pooled;
-    h+='<tr><td>'+names[m]+'</td>'+
-       '<td class="dim">'+(p?p.n:'—')+'</td>'+
-       '<td>'+(p?p.rho.toFixed(3):'—')+'</td>'+
-       '<td class="'+(p&&p.p<0.05?'':'dim')+'">'+(p?p.p.toFixed(4):'—')+'</td></tr>';
-  }
-  h+='</table>';
-
-  h+='<div class="sec"><h2>Per company</h2><table>'+
-     '<tr><th>Ticker</th><th>n</th><th>ρ max</th><th>p max</th></tr>';
-  for(const t of d.metrics.max.perTicker){
-    h+='<tr><td>'+t.ticker+'</td><td class="dim">'+t.n+'</td>'+
-       '<td>'+(t.rho!=null?t.rho.toFixed(3):'—')+'</td>'+
-       '<td class="dim">'+(t.p!=null?t.p.toFixed(3):'too few')+'</td></tr>';
-  }
-  h+='</table></div>';
-
-  const any=['max','p75','pooled'].some(m=>d.metrics[m].pooled&&d.metrics[m].pooled.p<0.05);
-  h+='<div class="note">All three metrics run every time and are all reported, so none of '+
-     'them was chosen after the fact. '+(any
-       ? 'Something is under 0.05 — but three tests means roughly three chances at a false '+
-         'positive, so the honest threshold here is about 0.017, and these companies move '+
-         'together so the effective sample is smaller than n.'
-       : 'Nothing is significant. At this sample size that is closer to "no data" than to '+
-         '"no effect" — the fix is more companies, not a different metric.')+
-     '</div>';
-  $('#tout').innerHTML=h;
-}
-
-function render(data,ticker){
-  const titles={mdna:'MD&A',risk:'Risk Factors'};
-  let html='';
-  for(const k of Object.keys(data)){
-    const rows=data[k]; if(!rows.length) continue;
-    const max=Math.max(0.02,...rows.map(r=>r.max||0));
-    html+='<div class="sec"><h2>'+ticker+' · '+titles[k]+'</h2><table>'+
-      '<tr><th>Filed</th><th>Form</th><th>Pooled</th><th>Max</th><th>p75</th><th style="width:22%"></th></tr>';
-    for(const r of rows){
-      const f=v=>v!=null?v.toFixed(4):'—';
-      html+='<tr'+(r.max!=null?' class="insp" data-filed="'+r.filed+'" data-sec="'+k+'"':'')+'>'+
-        '<td>'+r.filed+(r.max!=null?' <span class="dim">▸</span>':'')+'</td>'+
-        '<td class="dim">'+r.form+'</td>'+
-        '<td class="dim">'+f(r.pooled)+'</td>'+
-        '<td>'+f(r.max)+'</td>'+
-        '<td class="dim">'+f(r.p75)+'</td>'+
-        '<td>'+(r.max!=null?'<span class="bar" style="width:'+(r.max/max*100)+'%"></span>':'')+'</td></tr>';
-    }
-    html+='</table></div>';
-  }
-  html+='<div class="note"><b>Max</b> is the distance from each passage in this filing to its '+
-    'nearest passage in the previous same-form filing, taking the largest — "is there something '+
-    'here with no counterpart last quarter?" <b>Pooled</b> averages the whole section, which '+
-    'drowns one changed paragraph in the thirty that did not change. <b>p75</b> only rises when '+
-    'much of the section is rewritten.<br><br>'+
-    '<b>Tap any row</b> to read the passage that produced the max. A number cannot tell you '+
-    'whether it fired on a strategy shift or on a new legal disclaimer, and those mean opposite '+
-    'things.</div><div id="chunk"></div>';
-  $('#out').innerHTML=html;
-  requestAnimationFrame(()=>document.querySelectorAll('.bar').forEach(b=>b.classList.add('in')));
-
-  document.querySelectorAll('tr.insp').forEach(tr=>{
-    tr.onclick=async()=>{
-      const box=$('#chunk');
-      box.innerHTML='<div class="note">reading filing…</div>';
-      box.scrollIntoView({behavior:'smooth',block:'nearest'});
-      const d=await api('/api/topchunk?t='+ticker+'&cik='+$('#co').value+
-        '&filed='+tr.dataset.filed+'&section='+tr.dataset.sec);
-      if(d.error){ box.innerHTML='<div class="note">'+d.error+'</div>'; return; }
-      const esc=s=>s.replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
-      box.innerHTML='<div class="sec"><h2>'+d.filed+' · passage '+(d.chunkIndex+1)+' of '+d.of+
-        ' · distance '+d.distance.toFixed(4)+'</h2>'+
-        '<div class="quote">'+esc(d.text)+'</div>'+
-        '<h2 style="margin-top:22px">nearest passage in '+d.comparedTo+'</h2>'+
-        '<div class="quote dim">'+esc(d.nearestPrevText)+'</div></div>';
-    };
-  });
-}
-</script></body></html>`;
+/* ─────────
