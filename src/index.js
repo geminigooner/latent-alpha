@@ -37,7 +37,6 @@ const MODELS = {
 };
 
 const getModel = (m) => MODELS[m] || MODELS.gemini;
-// Preserves all existing unprefixed Gemini rows in D1 while isolating Gemma 4 rows
 const secKey = (mId, ticker, filed, form, kind) =>
   mId === "gemini" ? `${ticker}:${filed}:${form}:${kind}` : `${mId}:${ticker}:${filed}:${form}:${kind}`;
 const secPrefix = (mId, ticker) =>
@@ -130,13 +129,9 @@ async function listFilings(cik, limit) {
       url: `https://www.sec.gov/Archives/edgar/data/${Number(cik)}/${acc}/${recent.primaryDocument[i]}`,
     });
   }
-  return out.reverse(); // oldest first
+  return out.reverse();
 }
 
-/**
- * Filing HTML -> flat visible text, streamed without buffering output HTML.
- * Skips <script>, <style>, and hidden iXBRL metadata blocks (display:none / hidden).
- */
 async function filingText(url) {
   const res = await fetch(url, { headers: { "User-Agent": SEC_UA, "Accept-Encoding": "gzip" } });
   if (!res.ok) throw new Error(`filing fetch ${res.status}`);
@@ -397,6 +392,31 @@ const normalize = (v) => {
   return Float32Array.from(v, (x) => x / n);
 };
 
+function decodeB64Bytes(s) {
+  if (typeof Uint8Array.fromBase64 === "function") return Uint8Array.fromBase64(s);
+  const bin = atob(s);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+/** Reads pooled vec whether stored as JSON "[...]" or legacy base64 Float32Array. */
+function parseVec(raw) {
+  if (!raw || typeof raw !== "string") return null;
+  const s = raw.trim();
+  if (!s) return null;
+  if (s[0] === "[") {
+    try { return normalize(JSON.parse(s)); } catch { return null; }
+  }
+  try {
+    const bytes = decodeB64Bytes(s);
+    if (bytes.byteLength < 16 || bytes.byteLength % 4 !== 0) return null;
+    return normalize(new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4));
+  } catch {
+    return null;
+  }
+}
+
 function packVecs(vecs) {
   const d = vecs[0].length;
   const flat = new Float32Array(vecs.length * d);
@@ -411,21 +431,30 @@ function packVecs(vecs) {
 }
 
 function unpackVecs(b64, d) {
-  let bytes;
-  if (typeof Uint8Array.fromBase64 === "function") {
-    bytes = Uint8Array.fromBase64(b64);
-  } else {
-    const bin = atob(b64);
-    bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  if (!b64 || typeof b64 !== "string") return [];
+  const s = b64.trim();
+  if (s[0] === "[") {
+    try {
+      return JSON.parse(s).map((v) => normalize(v)).filter((v) => v.length === d);
+    } catch { return []; }
   }
-  const f = new Float32Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 4));
-  const out = [];
-  for (let i = 0; i + d <= f.length; i += d) out.push(f.subarray(i, i + d));
-  return out;
+  try {
+    const bytes = decodeB64Bytes(s);
+    const f = new Float32Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 4));
+    const out = [];
+    for (let i = 0; i + d <= f.length; i += d) out.push(f.subarray(i, i + d));
+    return out;
+  } catch {
+    return [];
+  }
 }
 
-const cosine = (a, b) => { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * b[i]; return s; };
+const cosine = (a, b) => {
+  if (!a || !b || a.length !== b.length) return 0;
+  let s = 0;
+  for (let i = 0; i < a.length; i++) s += a[i] * b[i];
+  return s;
+};
 
 /* ─────────────────────────────────────────────── extract + ingest */
 
@@ -437,9 +466,13 @@ async function extractFiling(body, env) {
   const kinds = ["mdna", "risk"];
   const keys = kinds.map((k) => secKey(m.id, ticker, filed, form, k));
   const have = await env.DB.prepare(
-    `SELECT key FROM sections WHERE chunks IS NOT NULL AND key IN (${keys.map(() => "?").join(",")})`
+    `SELECT key, vec FROM sections WHERE chunks IS NOT NULL AND key IN (${keys.map(() => "?").join(",")})`
   ).bind(...keys).all();
-  const stored = new Set(have.results.map((r) => r.key));
+  const stored = new Set(
+    have.results
+      .filter((r) => { const v = parseVec(r.vec); return v && v.length === m.dim; })
+      .map((r) => r.key)
+  );
   if (stored.size === keys.length) {
     return { filed, form, model: m.id, cached: true, sections: { mdna: { cached: true }, risk: { cached: true } } };
   }
@@ -490,9 +523,13 @@ async function ingest(body, env) {
   const kinds = section && formSpec[section] ? [section] : ["mdna", "risk"];
   const keys = kinds.map((k) => secKey(m.id, ticker, filed, form, k));
   const have = await env.DB.prepare(
-    `SELECT key FROM sections WHERE chunks IS NOT NULL AND key IN (${keys.map(() => "?").join(",")})`
+    `SELECT key, vec FROM sections WHERE chunks IS NOT NULL AND key IN (${keys.map(() => "?").join(",")})`
   ).bind(...keys).all();
-  const stored = new Set(have.results.map((r) => r.key));
+  const stored = new Set(
+    have.results
+      .filter((r) => { const v = parseVec(r.vec); return v && v.length === m.dim; })
+      .map((r) => r.key)
+  );
   if (stored.size === keys.length) {
     return { filed, form, model: m.id, skipped: true, sections: kinds.map((k) => ({ kind: k, status: "cached" })) };
   }
@@ -530,6 +567,7 @@ async function ingest(body, env) {
 /* ─────────────────────────────────────────────── novelty */
 
 function shiftMetrics(cur, prev) {
+  if (!cur.length || !prev.length) return null;
   const dists = cur.map((a) => {
     let best = 2;
     for (const b of prev) {
@@ -547,7 +585,7 @@ function shiftMetrics(cur, prev) {
 
 async function novelty(ticker, env, onlyKinds = ["mdna", "risk"], modelParam = "gemini") {
   const m = getModel(modelParam);
-  const b64PerChunk = (m.dim * 4 / 3) * 4; // 4096 for 768d Gemma 4, 8192 for 1536d Gemini
+  const b64PerChunk = (m.dim * 4 / 3) * 4;
   await ensureTables(env);
 
   const { results: metaRows } = await env.DB.prepare(
@@ -562,11 +600,14 @@ async function novelty(ticker, env, onlyKinds = ["mdna", "risk"], modelParam = "
 
   const out = { model: m.id };
   for (const kind of onlyKinds) {
-    const rows = metaRows.filter((r) => r.section === kind).map((r) => ({
-      ...r,
-      v: JSON.parse(r.vec),
-      nChunks: r.chunks_len ? Math.round(r.chunks_len / b64PerChunk) : 0,
-    }));
+    const rows = metaRows
+      .filter((r) => r.section === kind)
+      .map((r) => ({
+        ...r,
+        v: parseVec(r.vec),
+        nChunks: r.chunks_len ? Math.round(r.chunks_len / b64PerChunk) : 0,
+      }))
+      .filter((r) => r.v && r.v.length === m.dim);
 
     const needBlobKeys = new Set();
     const pairs = rows.map((r, i) => {
@@ -589,7 +630,10 @@ async function novelty(ticker, env, onlyKinds = ["mdna", "risk"], modelParam = "
           `SELECT key, chunks FROM sections WHERE key IN (${slice.map(() => "?").join(",")})`
         ).bind(...slice).all();
         for (const row of blobs) {
-          if (row.chunks) chunkMap.set(row.key, unpackVecs(row.chunks, m.dim));
+          if (row.chunks) {
+            const unpacked = unpackVecs(row.chunks, m.dim);
+            if (unpacked.length) chunkMap.set(row.key, unpacked);
+          }
         }
       }
     }
@@ -600,11 +644,13 @@ async function novelty(ticker, env, onlyKinds = ["mdna", "risk"], modelParam = "
       let s = cKey ? shiftMap.get(cKey) : null;
       if (!s && prev && chunkMap.has(r.key) && chunkMap.has(prev.key)) {
         s = shiftMetrics(chunkMap.get(r.key), chunkMap.get(prev.key));
-        shiftMap.set(cKey, s);
-        writes.push(
-          env.DB.prepare(`INSERT OR REPLACE INTO shift_cache (key, max, p75) VALUES (?, ?, ?)`)
-            .bind(cKey, s.max, s.p75)
-        );
+        if (s) {
+          shiftMap.set(cKey, s);
+          writes.push(
+            env.DB.prepare(`INSERT OR REPLACE INTO shift_cache (key, max, p75) VALUES (?, ?, ?)`)
+              .bind(cKey, s.max, s.p75)
+          );
+        }
       }
       return {
         filed: r.filed, form: r.form, chars: r.chars, chunks: r.nChunks,
@@ -769,7 +815,10 @@ async function volTest(tickerParam, env, modelParam = "gemini") {
   const m = getModel(modelParam);
   await ensureTables(env);
   const { results: priceRows } = await env.DB.prepare(`SELECT ticker, data FROM series`).all();
-  const priceMap = new Map(priceRows.map((r) => [r.ticker, JSON.parse(r.data)]));
+  const priceMap = new Map();
+  for (const r of priceRows) {
+    try { priceMap.set(r.ticker, JSON.parse(r.data)); } catch {}
+  }
 
   const { results: secRows } = await env.DB.prepare(
     `SELECT DISTINCT ticker FROM sections`
@@ -868,6 +917,7 @@ async function topChunk(params, env) {
 
   const curV = unpackVecs(cur.chunks, m.dim);
   const prevV = unpackVecs(prev.chunks, m.dim);
+  if (!curV.length || !prevV.length) throw new Error("chunk vectors have incompatible dimension");
 
   let worstIdx = 0, worstDist = -1;
   for (let i = 0; i < curV.length; i++) {
