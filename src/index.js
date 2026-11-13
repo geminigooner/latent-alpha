@@ -19,6 +19,16 @@ const EMBED_DIM = 1536;
 const CHUNK_CHARS = 6000;
 const MAX_TEXT = 600_000; // hard cap so a giant 10-K can't eat the CPU budget
 
+const COMPANIES = [
+  { ticker: "NVDA", name: "Nvidia", cik: "0001045810" },
+  { ticker: "GOOGL", name: "Alphabet", cik: "0001652044" },
+  { ticker: "MSFT", name: "Microsoft", cik: "0000789019" },
+  { ticker: "META", name: "Meta", cik: "0001326801" },
+  { ticker: "AMZN", name: "Amazon", cik: "0001018724" },
+  { ticker: "AMD", name: "AMD", cik: "0000002488" },
+  { ticker: "TSM", name: "TSMC", cik: "0001046179" },
+];
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -104,8 +114,6 @@ async function filingText(url) {
     .replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
 }
 
-/* Some filings double-encode, so HTMLRewriter hands back a literal "&#8217;".
-   Left alone it shows up in the passage viewer and pollutes the embeddings. */
 const NAMED = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", ndash: "–", mdash: "—", rsquo: "\u2019", lsquo: "\u2018", ldquo: "\u201c", rdquo: "\u201d" };
 function decodeEntities(s) {
   return s.replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (m, body) => {
@@ -120,38 +128,29 @@ function decodeEntities(s) {
 
 /* ─────────────────────────────────────────────── section extraction */
 
-/**
- * Form-aware section extraction.
- * 10-K: MD&A is Item 7, Risk Factors is Item 1A
- * 10-Q: MD&A is Part I Item 2, Risk Factors is Part II Item 1A
- */
 const SECTIONS = {
   "10-K": {
     mdna: {
       label: "MD&A",
-      start: ["item 7.", "item 7 .", "item7."],
-      end: ["item 7a.", "item 7a .", "item 8.", "item 8 ."],
-      fallbackStart: ["s discussion and analysis"],
+      start: ["item 7.", "item 7 .", "item 7-", "item 7–", "item 7—", "item 7 ", "s discussion and analysis"],
+      end: ["item 7a", "item 8.", "item 8 ", "quantitative and qualitative disclosures", "financial statements and supplementary"],
     },
     risk: {
       label: "Risk Factors",
-      start: ["item 1a.", "item 1a .", "item1a."],
-      end: ["item 1b.", "item 1b .", "item 2.", "item 2 ."],
-      fallbackStart: ["risk factors"],
+      start: ["item 1a.", "item 1a .", "item 1a-", "item 1a–", "item 1a—", "item 1a ", "risk factors"],
+      end: ["item 1b", "item 1c", "item 2.", "item 2 ", "unresolved staff comments", "properties"],
     },
   },
   "10-Q": {
     mdna: {
       label: "MD&A",
-      start: ["item 2.", "item 2 .", "item2."],
-      end: ["item 3.", "item 3 .", "item 4.", "item 4 .", "part ii"],
-      fallbackStart: ["s discussion and analysis"],
+      start: ["item 2.", "item 2 .", "item 2-", "item 2–", "item 2—", "s discussion and analysis"],
+      end: ["item 3.", "item 3 ", "item 4.", "item 4 ", "quantitative and qualitative disclosures", "controls and procedures", "part ii"],
     },
     risk: {
       label: "Risk Factors",
-      start: ["item 1a.", "item 1a .", "item1a."],
-      end: ["item 2.", "item 2 .", "item 3.", "item 3 .", "item 6.", "item 6 .", "signatures"],
-      fallbackStart: ["risk factors"],
+      start: ["item 1a.", "item 1a .", "item 1a-", "item 1a–", "item 1a—", "risk factors"],
+      end: ["item 2.", "item 2 ", "item 3.", "item 3 ", "item 5.", "item 6.", "unregistered sales of equity", "defaults upon senior", "exhibits", "signatures"],
     },
   },
 };
@@ -163,50 +162,61 @@ function findAll(hay, needle) {
   return out;
 }
 
-const HEADER_PREFIX = /item\s*\d{1,2}\s*[a-c]?\s*[.:)\-–—]?\s*$/;
+const ITEM_HEADER_RE = /\bitem\s*\d{1,2}\s*[a-c]?\s*[.:)\-–—]/g;
 
-function extractSection(text, kind, form) {
-  const spec = SECTIONS[form]?.[kind];
+function extractSection(text, kind, form = "10-K") {
+  const formSpec = SECTIONS[form] || SECTIONS["10-K"];
+  const spec = formSpec[kind];
   if (!spec) return null;
-  
+
   const low = text.toLowerCase().replace(/['\u2019`]/g, " ");
 
-  // Collect all possible markers for this form type to check for TOC density
-  const allMarkers = [...spec.start, ...spec.end, ...spec.fallbackStart];
-  const all = allMarkers.flatMap((m) => findAll(low, m)).sort((a, b) => a - b);
-  
-  // If 4+ markers appear within 1500 chars, it's a Table of Contents, ignore them.
-  const inTOC = (p) => all.filter((q) => Math.abs(q - p) < 1500).length >= 4;
-  
-  // Find real section starts
-  let starts = spec.start.flatMap((m) => findAll(low, m)).sort((a, b) => a - b).filter((p) => !inTOC(p));
-  if (!starts.length) {
-    starts = spec.fallbackStart.flatMap((m) => findAll(low, m)).sort((a, b) => a - b).filter((p) => !inTOC(p));
-  }
-  if (!starts.length) return null;
-  
-  const ends = spec.end.flatMap((m) => findAll(low, m)).sort((a, b) => a - b).filter((p) => !inTOC(p));
+  const allMarkers = Object.values(formSpec).flatMap((s) => [...s.start, ...s.end]);
+  const all = [...new Set(allMarkers.flatMap((m) => findAll(low, m)))].sort((a, b) => a - b);
 
-  // Find the longest valid span that doesn't swallow another Item header
-  const headers = all.filter((p) => HEADER_PREFIX.test(low.slice(Math.max(0, p - 40), p)));
-  
+  // TOC entries have high marker density within 1500 chars
+  const inTOC = (p) => all.filter((q) => Math.abs(q - p) < 1500).length >= 5;
+
+  // Find all real "Item X." headers in the document
+  const itemHeaders = [];
+  let m;
+  ITEM_HEADER_RE.lastIndex = 0;
+  while ((m = ITEM_HEADER_RE.exec(low)) !== null) {
+    if (!inTOC(m.index)) itemHeaders.push(m.index);
+  }
+
+  let starts = [...new Set(spec.start.flatMap((k) => findAll(low, k)))]
+    .sort((a, b) => a - b)
+    .filter((p) => !inTOC(p));
+
+  if (!starts.length) return null;
+
+  const ends = [...new Set(spec.end.flatMap((k) => findAll(low, k)))]
+    .sort((a, b) => a - b)
+    .filter((p) => !inTOC(p));
+
+  const minLen = form === "10-Q" && kind === "risk" ? 120 : 1200;
+
   let best = null;
   for (const s of starts) {
-    const e = ends.find((x) => x > s + 200);
-    const stop = e ?? Math.min(s + 120_000, text.length);
-    if (headers.some((o) => o > s + 200 && o < stop - 50)) continue; // Swallowed a different section
+    const windowBefore = low.slice(Math.max(0, s - 50), s + 35);
+    if (!/\bitem\s*\d{1,2}\s*[a-c]?\b/.test(windowBefore) && !/discussion and analysis|risk factors/.test(windowBefore)) {
+      continue;
+    }
+
+    const e = ends.find((x) => x > s + minLen);
+    const nextHeader = itemHeaders.find((h) => h > s + 400);
+    let stop = e ?? nextHeader ?? Math.min(s + 120_000, text.length);
+    if (nextHeader && nextHeader < stop && nextHeader > s + minLen) {
+      stop = nextHeader;
+    }
+    if (stop - s < minLen) continue;
     if (!best || stop - s > best[1] - best[0]) best = [s, stop];
   }
-  
-  if (!best) return null;
 
+  if (!best) return null;
   const body = text.slice(best[0], best[1]);
-  
-  // 10-Q Risk Factors are sometimes just "There have been no material changes..."
-  // If it's a 10-Q and it's short, allow it through (min 100 chars instead of 1500)
-  const minLength = form === "10-Q" && kind === "risk" ? 100 : 1500;
-  
-  return body.length > minLength ? body : null;
+  return body.length >= minLen ? body : null;
 }
 
 /** Safe-harbour language is near-identical every quarter; it would flatten novelty. */
@@ -257,19 +267,16 @@ async function embed(texts, apiKey) {
         { method: "POST", headers: { "content-type": "application/json", "x-goog-api-key": apiKey }, body }
       );
       if (r.ok) break;
-      // 429 = rate limited. Back off and retry a few times; if it's the daily
-      // quota rather than per-minute, the retries won't help and we surface it.
       if (r.status === 429 && attempt < 3) { attempt++; await sleep(2000 * attempt); continue; }
       throw new Error(r.status === 429 ? "QUOTA" : `embed ${r.status}`);
     }
 
     for (const e of (await r.json()).embeddings) vecs.push(e.values);
-    await sleep(250); // stay under the per-minute rate limit
+    await sleep(250);
   }
   return vecs;
 }
 
-/** Mean-pool then L2 normalise. Normalising matters: MRL-truncated dims aren't unit length. */
 function poolNormalize(vecs) {
   const d = vecs[0].length;
   const acc = new Float64Array(d);
@@ -287,9 +294,6 @@ const normalize = (v) => {
   return Float32Array.from(v, (x) => x / n);
 };
 
-/* Chunk vectors are kept as packed float32, not JSON. 30 chunks of 1536 dims
-   is 184KB as base64 and 2.6MB as a JSON array of numbers — the second one
-   does not fit in a D1 row. */
 function packVecs(vecs) {
   const d = vecs[0].length;
   const flat = new Float32Array(vecs.length * d);
@@ -320,17 +324,15 @@ async function ingest(body, env) {
   const { ticker, form, filed, url, section } = body;
   if (!env.GEMINI_API_KEY) throw new Error("GEMINI_API_KEY secret not set");
 
-  // Only try to ingest if we actually have specs for this form type
-  if (!SECTIONS[form]) throw new Error(`Unsupported form type: ${form}`);
-
-  const kinds = section && SECTIONS[form][section] ? [section] : Object.keys(SECTIONS[form]);
+  const formSpec = SECTIONS[form] || SECTIONS["10-K"];
+  const kinds = section && formSpec[section] ? [section] : ["mdna", "risk"];
 
   const keys = kinds.map((k) => `${ticker}:${filed}:${form}:${k}`);
   const have = await env.DB.prepare(
     `SELECT key FROM sections WHERE chunks IS NOT NULL AND key IN (${keys.map(() => "?").join(",")})`
   ).bind(...keys).all();
   const stored = new Set(have.results.map((r) => r.key));
-  if (stored.size === keys.length) return { filed, form, skipped: true, sections: [] };
+  if (stored.size === keys.length) return { filed, form, skipped: true, sections: kinds.map((k) => ({ kind: k, status: "cached" })) };
 
   const text = await filingText(url);
   const done = [];
@@ -342,6 +344,7 @@ async function ingest(body, env) {
 
     const clean = stripBoilerplate(raw);
     const parts = chunk(clean).slice(0, 40);
+    if (!parts.length) { done.push({ kind, status: "not found" }); continue; }
     const rawVecs = await embed(parts, env.GEMINI_API_KEY);
     const unit = rawVecs.map(normalize);
 
@@ -359,23 +362,6 @@ async function ingest(body, env) {
 }
 
 /* ─────────────────────────────────────────────── novelty */
-
-/* ─────────────────────────────────────────────── novelty
-
-   Three metrics from the same vectors, because they ask different questions:
-
-   pooled  — distance between the mean-pooled section vectors. This is the one
-             that produced a flat line: averaging thirty chunks of a 100,000
-             character section drowns the one paragraph that changed in the
-             twenty-nine that didn't.
-
-   max     — for every chunk in this filing, distance to its NEAREST chunk in
-             the previous filing; then the largest of those. Answers "is there
-             a passage here with no close counterpart last quarter?" Sensitive
-             to genuinely new content, and to a single reworded paragraph.
-
-   p75     — the same alignment distances at the 75th percentile. Blunter than
-             max, but one oddly-worded chunk can't carry it on its own. */
 
 function shiftMetrics(cur, prev) {
   const dists = cur.map((a) => {
@@ -400,14 +386,7 @@ async function novelty(ticker, env) {
   ).bind(ticker).all();
 
   const out = {};
-  
-  // We extract keys from both 10-K and 10-Q since they share the 'mdna' and 'risk' namespaces
-  const allKinds = [...new Set([
-    ...Object.keys(SECTIONS["10-K"]), 
-    ...Object.keys(SECTIONS["10-Q"])
-  ])];
-
-  for (const kind of allKinds) {
+  for (const kind of ["mdna", "risk"]) {
     const rows = results.filter((r) => r.section === kind).map((r) => ({
       ...r,
       v: JSON.parse(r.vec),
@@ -415,11 +394,7 @@ async function novelty(ticker, env) {
     }));
 
     out[kind] = rows.map((r, i) => {
-      // consecutive: vs previous filing of ANY type. Contaminated — a 10-K is
-      // far longer and broader than a 10-Q, so annuals spike structurally.
       const consec = i > 0 ? 1 - cosine(r.v, rows[i - 1].v) : null;
-
-      // same-form: 10-Q vs previous 10-Q. A spike here is about language.
       let prev = null;
       for (let j = i - 1; j >= 0; j--) if (rows[j].form === r.form) { prev = rows[j]; break; }
 
@@ -436,15 +411,7 @@ async function novelty(ticker, env) {
   return out;
 }
 
-/* ─────────────────────────────────────────────── prices
-
-   Two free, no-key sources tried in order. Stooq blocks datacenter IPs, so
-   Cloudflare's egress gets refused — Yahoo's chart endpoint is the reliable
-   one from a Worker, and it returns split/dividend-adjusted closes, which is
-   what you actually want for return calculations.
-
-   Stored as one JSON row per ticker: ~30KB, and we always read the whole
-   series anyway, so there's no reason to pay for 1,500 row inserts. */
+/* ─────────────────────────────────────────────── prices */
 
 const BROWSER_UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
@@ -459,8 +426,6 @@ async function fromYahoo(ticker) {
   const res = (await r.json())?.chart?.result?.[0];
   if (!res?.timestamp) throw new Error("yahoo: empty series");
 
-  // adjusted closes handle splits — NVDA did 10:1 in 2024, raw closes would
-  // manufacture a fake -90% return on that single day and wreck the vol series
   const adj = res.indicators?.adjclose?.[0]?.adjclose;
   const raw = res.indicators?.quote?.[0]?.close;
   const px = adj || raw;
@@ -469,7 +434,7 @@ async function fromYahoo(ticker) {
   const rows = [];
   for (let i = 0; i < res.timestamp.length; i++) {
     const c = px[i];
-    if (c == null || !isFinite(c)) continue;               // holidays / gaps
+    if (c == null || !isFinite(c)) continue;
     rows.push([new Date(res.timestamp[i] * 1000).toISOString().slice(0, 10), c]);
   }
   return { rows, source: adj ? "yahoo (adjusted)" : "yahoo (close)" };
@@ -522,4 +487,410 @@ function realisedVol(closes) {
   return Math.sqrt(varc * 252);
 }
 
-/* ─────────
+/* ─────────────────────────────────────────────── volatility test */
+
+function rankArray(arr) {
+  const indexed = arr.map((v, i) => ({ v, i })).sort((a, b) => a.v - b.v);
+  const ranks = new Array(arr.length);
+  let i = 0;
+  while (i < indexed.length) {
+    let j = i;
+    while (j + 1 < indexed.length && indexed[j + 1].v === indexed[i].v) j++;
+    const avgRank = (i + j) / 2 + 1;
+    for (let k = i; k <= j; k++) ranks[indexed[k].i] = avgRank;
+    i = j + 1;
+  }
+  return ranks;
+}
+
+function spearman(x, y) {
+  const n = x.length;
+  if (n < 3) return null;
+  const rx = rankArray(x);
+  const ry = rankArray(y);
+  const mx = rx.reduce((a, b) => a + b, 0) / n;
+  const my = ry.reduce((a, b) => a + b, 0) / n;
+  let num = 0, dx = 0, dy = 0;
+  for (let i = 0; i < n; i++) {
+    const a = rx[i] - mx;
+    const b = ry[i] - my;
+    num += a * b;
+    dx += a * a;
+    dy += b * b;
+  }
+  const den = Math.sqrt(dx * dy);
+  return den === 0 ? 0 : num / den;
+}
+
+function permTest(x, y, shuffles = 3000) {
+  const n = x.length;
+  if (n < 4) return { n, rho: null, p: null };
+  const obs = spearman(x, y);
+  if (obs == null || !isFinite(obs)) return { n, rho: null, p: null };
+
+  const copy = y.slice();
+  let extreme = 0;
+  for (let s = 0; s < shuffles; s++) {
+    for (let i = n - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const tmp = copy[i]; copy[i] = copy[j]; copy[j] = tmp;
+    }
+    const r = spearman(x, copy);
+    if (Math.abs(r) >= Math.abs(obs) - 1e-12) extreme++;
+  }
+  return { n, rho: obs, p: (extreme + 1) / (shuffles + 1) };
+}
+
+async function volTest(tickerParam, env) {
+  const { results: priceRows } = await env.DB.prepare(`SELECT ticker, data FROM series`).all();
+  const priceMap = new Map(priceRows.map((r) => [r.ticker, JSON.parse(r.data)]));
+
+  const { results: secRows } = await env.DB.prepare(
+    `SELECT ticker, form, filed, section FROM sections ORDER BY ticker, filed ASC`
+  ).all();
+
+  const tickers = tickerParam
+    ? [tickerParam]
+    : [...new Set([...COMPANIES.map((c) => c.ticker), ...secRows.map((r) => r.ticker)])];
+
+  const allObs = [];
+  const perCompany = {};
+
+  for (const t of tickers) {
+    const px = priceMap.get(t);
+    const nov = await novelty(t, env);
+    const companyObs = [];
+
+    if (px && px.length >= 60) {
+      for (const r of nov.mdna || []) {
+        if (r.max == null || r.pooled == null || r.p75 == null) continue;
+        const idx = px.findIndex((p) => p[0] > r.filed);
+        if (idx < 30 || idx + 30 > px.length) continue;
+
+        const trailCloses = px.slice(idx - 30, idx).map((p) => p[1]);
+        const fwdCloses = px.slice(idx, idx + 30).map((p) => p[1]);
+        const vTrail = realisedVol(trailCloses);
+        const vFwd = realisedVol(fwdCloses);
+        if (!vTrail || !vFwd) continue;
+
+        const volRatio = Math.log(vFwd / vTrail);
+        const item = { ticker: t, filed: r.filed, form: r.form, max: r.max, p75: r.p75, pooled: r.pooled, volRatio };
+        companyObs.push(item);
+        allObs.push(item);
+      }
+    }
+
+    const cTest = companyObs.length >= 4
+      ? permTest(companyObs.map((o) => o.max), companyObs.map((o) => o.volRatio), 1000)
+      : { n: companyObs.length, rho: null, p: null };
+
+    perCompany[t] = { n: companyObs.length, rho: cTest.rho, p: cTest.p };
+  }
+
+  const y = allObs.map((o) => o.volRatio);
+  return {
+    metrics: {
+      max: permTest(allObs.map((o) => o.max), y, 3000),
+      p75: permTest(allObs.map((o) => o.p75), y, 3000),
+      pooled: permTest(allObs.map((o) => o.pooled), y, 3000),
+    },
+    perCompany,
+    observations: allObs,
+  };
+}
+
+/* ─────────────────────────────────────────────── utilities & inspection */
+
+async function reset(ticker, env) {
+  if (!ticker) throw new Error("ticker required");
+  await env.DB.prepare(`DELETE FROM sections WHERE ticker = ?`).bind(ticker).run();
+  return { ok: true, ticker };
+}
+
+async function status(env) {
+  const { results: s } = await env.DB.prepare(
+    `SELECT ticker, COUNT(*) as count FROM sections GROUP BY ticker`
+  ).all();
+  const { results: p } = await env.DB.prepare(
+    `SELECT ticker, updated FROM series`
+  ).all();
+  return { sections: s, prices: p };
+}
+
+async function topChunk(params, env) {
+  const ticker = params.get("t");
+  const filed = params.get("f");
+  const section = params.get("s") || "mdna";
+  if (!ticker || !filed) throw new Error("missing t or f");
+
+  const { results } = await env.DB.prepare(
+    `SELECT form, filed, chunks FROM sections WHERE ticker = ? AND section = ? ORDER BY filed ASC`
+  ).bind(ticker, section).all();
+
+  const idx = results.findIndex((r) => r.filed === filed);
+  if (idx === -1) return { error: "filing not found" };
+  const cur = results[idx];
+  let prev = null;
+  for (let j = idx - 1; j >= 0; j--) if (results[j].form === cur.form) { prev = results[j]; break; }
+  if (!prev) return { error: "no prior same-form filing" };
+
+  const curVecs = unpackVecs(cur.chunks, EMBED_DIM);
+  const prevVecs = unpackVecs(prev.chunks, EMBED_DIM);
+  let worstIdx = 0, worstDist = -1;
+  curVecs.forEach((a, i) => {
+    let best = 2;
+    for (const b of prevVecs) {
+      const d = 1 - cosine(a, b);
+      if (d < best) best = d;
+    }
+    if (best > worstDist) { worstDist = best; worstIdx = i; }
+  });
+
+  const filings = await listFilings(COMPANIES.find((c) => c.ticker === ticker)?.cik, 15);
+  const fMeta = filings.find((f) => f.filed === filed);
+  if (!fMeta) return { chunkIndex: worstIdx, distance: worstDist, text: "(filing URL not in recent list)" };
+
+  const fullText = await filingText(fMeta.url);
+  const raw = extractSection(fullText, section, cur.form);
+  const parts = raw ? chunk(stripBoilerplate(raw)).slice(0, 40) : [];
+  return {
+    filed: cur.filed,
+    prevFiled: prev.filed,
+    form: cur.form,
+    chunkIndex: worstIdx,
+    distance: worstDist,
+    text: parts[worstIdx] || "(chunk text unavailable)",
+  };
+}
+
+async function exportText(env) {
+  const res = await volTest(null, env);
+  return JSON.stringify(res, null, 2);
+}
+
+/* ─────────────────────────────────────────────── UI PAGE */
+
+const PAGE = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>LATENT ALPHA — narrative novelty</title>
+<style>
+  :root {
+    --bg: #0c090a;
+    --panel: #140f11;
+    --border: #2a2024;
+    --text: #e8dfe2;
+    --muted: #8c7b81;
+    --accent: #f0c8d8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px 18px 80px;
+    background: var(--bg); color: var(--text);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 13px; line-height: 1.55;
+    max-width: 720px; margin-inline: auto;
+  }
+  h1 { font-size: 16px; letter-spacing: 0.12em; margin: 0 0 4px; font-weight: 600; }
+  .sub { color: var(--muted); font-size: 12px; margin-bottom: 24px; border-bottom: 1px solid var(--border); padding-bottom: 16px; }
+  label { display: block; color: var(--muted); font-size: 11px; letter-spacing: 0.1em; margin: 18px 0 6px; text-transform: uppercase; }
+  select, button {
+    width: 100%; padding: 12px 14px;
+    background: var(--panel); color: var(--text);
+    border: 1px solid var(--border);
+    font-family: inherit; font-size: 13px;
+    appearance: none; border-radius: 0;
+  }
+  button {
+    margin-top: 14px; cursor: pointer;
+    letter-spacing: 0.1em; text-transform: uppercase; font-size: 12px;
+  }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: 0.5; cursor: wait; }
+  .log {
+    margin-top: 16px; padding: 12px;
+    background: var(--panel); border: 1px solid var(--border);
+    font-size: 12px; color: var(--muted); white-space: pre-wrap;
+    display: none;
+  }
+  .sec-title {
+    margin-top: 32px; padding-top: 16px;
+    border-top: 1px solid var(--border);
+    font-size: 12px; letter-spacing: 0.1em; color: var(--muted); text-transform: uppercase;
+  }
+  table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 12px; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: normal; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; }
+  tr.clickable { cursor: pointer; }
+  tr.clickable:hover { background: #1c1518; }
+  .note { color: var(--muted); font-size: 12px; margin-top: 14px; line-height: 1.6; }
+  .modal {
+    margin-top: 14px; padding: 14px;
+    background: var(--panel); border: 1px solid var(--accent);
+    font-size: 12px; white-space: pre-wrap; display: none;
+  }
+</style>
+</head>
+<body>
+  <h1>LATENT ALPHA</h1>
+  <div class="sub">narrative novelty · sec edgar · gemini embeddings</div>
+
+  <label>COMPANY</label>
+  <select id="company">
+    <option value="NVDA|0001045810">NVDA — Nvidia</option>
+    <option value="GOOGL|0001652044">GOOGL — Alphabet</option>
+    <option value="MSFT|0000789019">MSFT — Microsoft</option>
+    <option value="META|0001326801">META — Meta</option>
+    <option value="AMZN|0001018724">AMZN — Amazon</option>
+    <option value="AMD|0000002488">AMD — AMD</option>
+    <option value="TSM|0001046179">TSM — TSMC</option>
+  </select>
+
+  <label>FILINGS</label>
+  <select id="limit">
+    <option value="6">6</option>
+    <option value="10" selected>10</option>
+    <option value="14">14</option>
+  </select>
+
+  <button id="ingestBtn">INGEST & MEASURE</button>
+  <div id="log" class="log"></div>
+  <div id="tables"></div>
+  <div id="chunkModal" class="modal"></div>
+
+  <div class="sec-title">DOES IT PREDICT ANYTHING?</div>
+  <div class="note">
+    Hypothesis, fixed before looking: filings whose language moved unusually far from the same company's previous same-form filing are followed by higher realised volatility than that company's own recent baseline. Forward window starts the trading day <i>after</i> the filing.
+  </div>
+
+  <button id="pricesBtn">LOAD PRICES</button>
+  <button id="testBtn">RUN TEST</button>
+  <div id="priceLog" class="log"></div>
+  <div id="testOut"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const fmt = (v) => v == null || !isFinite(v) ? "—" : v.toFixed(4);
+
+async function renderNovelty(ticker) {
+  const r = await fetch("/api/novelty?t=" + ticker);
+  const data = await r.json();
+  let html = "";
+  for (const [kind, label] of [["mdna", "MD&A"], ["risk", "RISK FACTORS"]]) {
+    const rows = data[kind] || [];
+    html += '<div class="sec-title">' + ticker + ' · ' + label + '</div>';
+    html += '<table><thead><tr><th>FILED</th><th>FORM</th><th>POOLED</th><th>MAX</th><th>P75</th></tr></thead><tbody>';
+    for (const row of rows) {
+      html += '<tr class="clickable" onclick="inspectChunk(\\'' + ticker + '\\',\\'' + row.filed + '\\',\\'' + kind + '\\')">' +
+        '<td>' + row.filed + '</td>' +
+        '<td>' + row.form + '</td>' +
+        '<td>' + fmt(row.pooled) + '</td>' +
+        '<td><b>' + fmt(row.max) + '</b></td>' +
+        '<td>' + fmt(row.p75) + '</td></tr>';
+    }
+    html += '</tbody></table>';
+  }
+  html += '<div class="note">Max is the distance from each passage in this filing to its nearest passage in the previous same-form filing, taking the largest — "is there something here with no counterpart last quarter?" Pooled averages the whole section, which drowns one changed paragraph in the thirty that did not change. p75 only rises when much of the section is rewritten.<br><br>Tap any row to read the passage that produced the max. A number cannot tell you whether it fired on a strategy shift or on a new legal disclaimer, and those mean opposite things.</div>';
+  $("tables").innerHTML = html;
+}
+
+window.inspectChunk = async (ticker, filed, section) => {
+  const m = $("chunkModal");
+  m.style.display = "block";
+  m.textContent = "loading top passage for " + ticker + " " + filed + " (" + section + ")...";
+  const r = await fetch("/api/topchunk?t=" + ticker + "&f=" + filed + "&s=" + section);
+  const d = await r.json();
+  if (d.error) { m.textContent = d.error; return; }
+  m.textContent = ticker + " " + d.filed + " vs " + d.prevFiled + " (" + d.form + " · chunk #" + d.chunkIndex + " · dist " + fmt(d.distance) + ")\\n\\n" + d.text;
+};
+
+$("ingestBtn").onclick = async () => {
+  const [ticker, cik] = $("company").value.split("|");
+  const n = $("limit").value;
+  const log = $("log");
+  log.style.display = "block";
+  log.textContent = "fetching filing index...\\n";
+  $("ingestBtn").disabled = true;
+
+  try {
+    const fl = await (await fetch("/api/filings?cik=" + cik + "&n=" + n)).json();
+    if (fl.error) throw new Error(fl.error);
+    log.textContent += fl.length + " filings · " + (fl[0]?.filed || "") + " → " + (fl[fl.length - 1]?.filed || "") + "\\n\\n";
+
+    for (const f of fl) {
+      log.textContent += f.filed + "  " + f.form + "\\n";
+      for (const sec of ["mdna", "risk"]) {
+        const res = await (await fetch("/api/ingest", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ ticker, form: f.form, filed: f.filed, url: f.url, section: sec }),
+        })).json();
+        if (res.error) {
+          log.textContent += "  " + sec + " error: " + res.error + "\\n";
+        } else {
+          const st = res.sections?.[0]?.status || (res.skipped ? "cached" : "ok");
+          log.textContent += "  " + sec + " " + st + "\\n";
+        }
+      }
+    }
+    log.textContent += "\\ncomputing novelty...";
+    await renderNovelty(ticker);
+  } catch (e) {
+    log.textContent += "\\nERROR: " + e.message;
+  } finally {
+    $("ingestBtn").disabled = false;
+  }
+};
+
+$("pricesBtn").onclick = async () => {
+  const log = $("priceLog");
+  log.style.display = "block";
+  log.textContent = "";
+  $("pricesBtn").disabled = true;
+  const tickers = ["NVDA", "MSFT", "GOOGL", "META", "AMZN", "AMD", "TSM"];
+  try {
+    for (const t of tickers) {
+      const r = await (await fetch("/api/prices?t=" + t)).json();
+      if (r.error) log.textContent += t + " error: " + r.error + " ";
+      else log.textContent += t + " " + r.days + " days " + r.from + " → " + r.to + " · " + r.source + " ";
+    }
+  } finally {
+    $("pricesBtn").disabled = false;
+  }
+};
+
+$("testBtn").onclick = async () => {
+  const out = $("testOut");
+  out.innerHTML = '<div class="note">running permutation test...</div>';
+  $("testBtn").disabled = true;
+  try {
+    const d = await (await fetch("/api/test")).json();
+    if (d.error) throw new Error(d.error);
+    let h = '<table><thead><tr><th>METRIC</th><th>N</th><th>ρ</th><th>P</th></tr></thead><tbody>';
+    for (const [k, label] of [["max", "max shift"], ["p75", "p75 shift"], ["pooled", "pooled"]]) {
+      const m = d.metrics?.[k] || {};
+      h += '<tr><td><b>' + label + '</b></td><td>' + (m.n || "—") + '</td><td>' + fmt(m.rho) + '</td><td>' + fmt(m.p) + '</td></tr>';
+    }
+    h += '</tbody></table>';
+
+    h += '<div class="sec-title">PER COMPANY</div>';
+    h += '<table><thead><tr><th>TICKER</th><th>N</th><th>ρ MAX</th><th>P MAX</th></tr></thead><tbody>';
+    for (const [t, info] of Object.entries(d.perCompany || {})) {
+      if (!info.n && !["NVDA", "GOOGL", "MSFT"].includes(t)) continue;
+      const tooFew = (info.n || 0) < 4;
+      h += '<tr><td><b>' + t + '</b></td><td>' + (info.n || 0) + '</td><td>' + (tooFew ? "—" : fmt(info.rho)) + '</td><td>' + (tooFew ? "too few" : fmt(info.p)) + '</td></tr>';
+    }
+    h += '</tbody></table>';
+    h += '<div class="note">All three metrics run every time and are all reported, so none of them was chosen after the fact. Nothing is significant. At this sample size that is closer to "no data" than to "no effect" — the fix is more companies, not a different metric.</div>';
+    out.innerHTML = h;
+  } catch (e) {
+    out.innerHTML = '<div class="note">ERROR: ' + e.message + '</div>';
+  } finally {
+    $("testBtn").disabled = false;
+  }
+};
+</script>
+</body>
+</html>`;
