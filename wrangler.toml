@@ -2,6 +2,9 @@ name = "latent-alpha"
 main = "src/index.js"
 compatibility_date = "2025-06-01"
 
+[ai]
+binding = "AI"
+
 [[d1_databases]]
 binding = "DB"
 database_name = "latent-alpha"
