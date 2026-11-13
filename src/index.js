@@ -5,6 +5,7 @@
  * Routes
  *   GET  /                    the page
  *   GET  /api/filings?cik=    list recent 10-K/10-Q from EDGAR
+ *   GET  /api/raw?url=        zero-CPU SEC stream passthrough (browser fallback for giant 10-Ks)
  *   POST /api/extract         fetch ONE filing once, extract & chunk sections
  *   POST /api/ingest          embed chunks for ONE section (Gemma 4 or Gemini), store in D1
  *   GET  /api/novelty?t=&m=   read D1, compute & cache novelty series for model m
@@ -15,7 +16,7 @@
 
 const SEC_UA = "Amanda Hatley ahatley094@gmail.com";
 const CHUNK_CHARS = 6000;
-const MAX_TEXT = 900_000;
+const MAX_TEXT = 650_000;
 
 const MODELS = {
   gemma2: {
@@ -66,6 +67,7 @@ export default {
                                 "cache-control": "no-store, must-revalidate",
                               } });
         case "/api/filings":  return json(await listFilings(url.searchParams.get("cik"), +(url.searchParams.get("n") || 10)));
+        case "/api/raw":      return proxySec(url.searchParams.get("url"));
         case "/api/extract":  return json(await extractFiling(await request.json(), env));
         case "/api/ingest":   return json(await ingest(await request.json(), env));
         case "/api/novelty":  return json(await novelty(url.searchParams.get("t"), env, ["mdna", "risk"], url.searchParams.get("m")));
@@ -132,45 +134,102 @@ async function listFilings(cik, limit) {
   return out.reverse();
 }
 
+/** Zero-CPU stream passthrough restricted strictly to SEC EDGAR archives. */
+async function proxySec(secUrl) {
+  if (!secUrl || !secUrl.startsWith("https://www.sec.gov/Archives/edgar/data/")) {
+    throw new Error("invalid SEC url");
+  }
+  const r = await fetch(secUrl, { headers: { "User-Agent": SEC_UA, "Accept-Encoding": "gzip" } });
+  if (!r.ok) throw new Error(`SEC fetch ${r.status}`);
+  return new Response(r.body, {
+    headers: { "content-type": "text/plain;charset=utf-8", "cache-control": "no-store" },
+  });
+}
+
+const BLOCK_OPEN_RE = /<(ix:header|ix:hidden|script|style)\b/i;
+
+/**
+ * Chunked HTML -> visible text stripper with zero per-tag JS callbacks.
+ * Jumps straight over multi-megabyte <ix:header> XBRL blocks in C++ indexOf.
+ */
 async function filingText(url) {
   const res = await fetch(url, { headers: { "User-Agent": SEC_UA, "Accept-Encoding": "gzip" } });
   if (!res.ok) throw new Error(`filing fetch ${res.status}`);
 
+  const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
   const parts = [];
-  let skip = 0, len = 0, cur = "";
+  let carry = "";
+  let waitClose = null;
+  let len = 0;
 
-  const rewritten = new HTMLRewriter()
-    .on('script, style, [hidden], [style*="display:none"], [style*="display: none"]', {
-      element(el) { skip++; el.onEndTag(() => { skip--; }); },
-    })
-    .onDocument({
-      text(t) {
-        if (skip || len >= MAX_TEXT) return;
-        if (t.text) cur += t.text;
-        if (t.lastInTextNode && cur) {
-          const trimmed = cur.trim();
-          if (trimmed) {
-            parts.push(trimmed);
-            len += trimmed.length + 1;
-          }
-          cur = "";
-        }
-      },
-    })
-    .transform(res);
-
-  const reader = rewritten.body.getReader();
   while (true) {
-    const { done } = await reader.read();
-    if (done || len >= MAX_TEXT) {
+    const { value, done } = await reader.read();
+    if (done) break;
+
+    let s = carry + value;
+    carry = "";
+
+    while (s.length > 0) {
+      if (waitClose) {
+        const idx = s.toLowerCase().indexOf(waitClose);
+        if (idx === -1) {
+          carry = s.slice(-16);
+          s = "";
+          break;
+        }
+        const gt = s.indexOf(">", idx + waitClose.length);
+        if (gt === -1) {
+          carry = s.slice(idx);
+          s = "";
+          break;
+        }
+        s = s.slice(gt + 1);
+        waitClose = null;
+        continue;
+      }
+
+      const m = BLOCK_OPEN_RE.exec(s);
+      if (m) {
+        const before = s.slice(0, m.index);
+        if (before) {
+          const txt = before.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+          if (txt) { parts.push(txt); len += txt.length + 1; }
+        }
+        waitClose = "</" + m[1].toLowerCase();
+        s = s.slice(m.index + m[0].length);
+        continue;
+      }
+
+      const lastLt = s.lastIndexOf("<");
+      const lastGt = s.lastIndexOf(">");
+      if (lastLt > lastGt) {
+        carry = s.slice(lastLt);
+        s = s.slice(0, lastLt);
+      } else {
+        const tailAmp = s.lastIndexOf("&");
+        if (tailAmp !== -1 && s.length - tailAmp < 12 && s.indexOf(";", tailAmp) === -1) {
+          carry = s.slice(tailAmp);
+          s = s.slice(0, tailAmp);
+        }
+      }
+
+      if (s) {
+        const txt = s.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+        if (txt) { parts.push(txt); len += txt.length + 1; }
+      }
+      break;
+    }
+
+    if (len >= MAX_TEXT) {
       await reader.cancel();
       break;
     }
   }
-  if (cur.trim() && len < MAX_TEXT) parts.push(cur.trim());
 
   return decodeEntities(parts.join(" "))
-    .replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
+    .replace(/\u00a0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 const NAMED = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", ndash: "–", mdash: "—", rsquo: "\u2019", lsquo: "\u2018", ldquo: "\u201c", rdquo: "\u201d" };
@@ -223,16 +282,12 @@ function findAll(hay, needle) {
 
 const ITEM_HEADER_RE = /\bitem\s*\d{1,2}\s*[a-c]?\s*[.:)\-–—]/g;
 
-function extractSection(text, kind, form = "10-K") {
+/** Pre-indexes markers & Item headers ONCE per filing so MD&A + Risk don't scan twice. */
+function prepareDocIndex(text, form = "10-K") {
   const formSpec = SECTIONS[form] || SECTIONS["10-K"];
-  const spec = formSpec[kind];
-  if (!spec) return null;
-
   const low = text.toLowerCase().replace(/['\u2019`]/g, " ");
-
   const allMarkers = Object.values(formSpec).flatMap((s) => [...s.start, ...s.end]);
   const all = [...new Set(allMarkers.flatMap((m) => findAll(low, m)))].sort((a, b) => a - b);
-
   const inTOC = (p) => all.filter((q) => Math.abs(q - p) < 1500).length >= 5;
 
   const itemHeaders = [];
@@ -241,11 +296,17 @@ function extractSection(text, kind, form = "10-K") {
   while ((m = ITEM_HEADER_RE.exec(low)) !== null) {
     if (!inTOC(m.index)) itemHeaders.push(m.index);
   }
+  return { text, low, form, formSpec, inTOC, itemHeaders };
+}
 
-  let starts = [...new Set(spec.start.flatMap((k) => findAll(low, k)))]
+function extractFromIndex(docIdx, kind) {
+  const { text, low, form, formSpec, inTOC, itemHeaders } = docIdx;
+  const spec = formSpec[kind];
+  if (!spec) return null;
+
+  const starts = [...new Set(spec.start.flatMap((k) => findAll(low, k)))]
     .sort((a, b) => a - b)
     .filter((p) => !inTOC(p));
-
   if (!starts.length) return null;
 
   const ends = [...new Set(spec.end.flatMap((k) => findAll(low, k)))]
@@ -274,6 +335,10 @@ function extractSection(text, kind, form = "10-K") {
   if (!best) return null;
   const body = text.slice(best[0], best[1]);
   return body.length >= minLen ? body : null;
+}
+
+function extractSection(text, kind, form = "10-K") {
+  return extractFromIndex(prepareDocIndex(text, form), kind);
 }
 
 function stripBoilerplate(t) {
@@ -400,7 +465,6 @@ function decodeB64Bytes(s) {
   return bytes;
 }
 
-/** Reads pooled vec whether stored as JSON "[...]" or legacy base64 Float32Array. */
 function parseVec(raw) {
   if (!raw || typeof raw !== "string") return null;
   const s = raw.trim();
@@ -459,7 +523,7 @@ const cosine = (a, b) => {
 /* ─────────────────────────────────────────────── extract + ingest */
 
 async function extractFiling(body, env) {
-  const { ticker, form, filed, url, model } = body;
+  const { ticker, form, filed, url, model, preText } = body;
   const m = getModel(model);
   await ensureTables(env);
 
@@ -477,14 +541,15 @@ async function extractFiling(body, env) {
     return { filed, form, model: m.id, cached: true, sections: { mdna: { cached: true }, risk: { cached: true } } };
   }
 
-  const text = await filingText(url);
+  const text = typeof preText === "string" ? preText : await filingText(url);
+  const docIdx = prepareDocIndex(text, form);
   const sections = {};
   for (const kind of kinds) {
     if (stored.has(secKey(m.id, ticker, filed, form, kind))) {
       sections[kind] = { cached: true };
       continue;
     }
-    const raw = extractSection(text, kind, form);
+    const raw = extractFromIndex(docIdx, kind);
     if (!raw) { sections[kind] = { status: "not found" }; continue; }
     const clean = stripBoilerplate(raw);
     const parts = chunk(clean).slice(0, 40);
@@ -535,11 +600,12 @@ async function ingest(body, env) {
   }
 
   const text = await filingText(url);
+  const docIdx = prepareDocIndex(text, form);
   const done = [];
 
   for (const kind of kinds) {
     if (stored.has(secKey(m.id, ticker, filed, form, kind))) { done.push({ kind, status: "cached" }); continue; }
-    const raw = extractSection(text, kind, form);
+    const raw = extractFromIndex(docIdx, kind);
     if (!raw) { done.push({ kind, status: "not found" }); continue; }
 
     const clean = stripBoilerplate(raw);
@@ -1099,6 +1165,21 @@ async function api(url, opts) {
   return data;
 }
 
+/** Browser-side HTML stripper fallback if a 50MB+ filing ever hits Worker 10ms CPU cap. */
+async function browserStripSec(secUrl) {
+  const r = await fetch("/api/raw?url=" + encodeURIComponent(secUrl));
+  if (!r.ok) throw new Error("raw fetch HTTP " + r.status);
+  const html = await r.text();
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  doc.querySelectorAll('script, style, [hidden], [style*="display:none"], [style*="display: none"]').forEach((e) => e.remove());
+  for (const tag of ["ix:header", "ix:hidden"]) {
+    const els = doc.getElementsByTagName(tag);
+    while (els.length) els[0].remove();
+  }
+  const rawTxt = (doc.body ? doc.body.textContent : doc.documentElement.textContent) || "";
+  return rawTxt.replace(/\\s+/g, " ").trim().slice(0, 650000);
+}
+
 function showTable(title, kind, ticker, mId, rows) {
   if (!rows.length) return "<h2>" + title + "</h2><div class=note>no sections stored yet for this model — tap INGEST &amp; MEASURE</div>";
   const vals = rows.map((r) => r.max).filter((v) => v != null);
@@ -1180,11 +1261,28 @@ $("ingestBtn").onclick = async () => {
     for (const f of fl) {
       log.textContent += f.filed + "  " + f.form + "\\n";
       try {
-        const ex = await api("/api/extract", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ ticker, form: f.form, filed: f.filed, url: f.url, model: mId }),
-        });
+        let ex;
+        try {
+          ex = await api("/api/extract", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ ticker, form: f.form, filed: f.filed, url: f.url, model: mId }),
+          });
+        } catch (exErr) {
+          if (String(exErr.message).includes("503") || String(exErr.message).includes("1102")) {
+            log.textContent += "  large filing · browser fallback…\\n";
+            log.scrollTop = log.scrollHeight;
+            const preText = await browserStripSec(f.url);
+            ex = await api("/api/extract", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ ticker, form: f.form, filed: f.filed, model: mId, preText }),
+            });
+          } else {
+            throw exErr;
+          }
+        }
+
         for (const sec of ["mdna", "risk"]) {
           const info = ex.sections && ex.sections[sec];
           if (!info || info.cached) {
